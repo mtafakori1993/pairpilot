@@ -58,6 +58,26 @@ export type WriteOutcome =
 const DOCUMENT_TIMEOUT_MS = 5000;
 /** Flush the buffer to the editor at least this often. */
 const FLUSH_INTERVAL_MS = 40;
+/**
+ * How long a newly opened document is watched for further version changes.
+ *
+ * `begin()` creates the file through `vscode.workspace.fs`, which is outside the
+ * editor. VS Code's file watcher notices, and the text model may reload the
+ * document a few tens of milliseconds later. An edit prepared against the
+ * version from before that reload is refused with "the file has changed in the
+ * meantime" — and because the developer did nothing, the refusal looks exactly
+ * like PairPilot losing their code. Waiting for the version to stand still
+ * removes the race rather than retrying around it.
+ */
+const SETTLE_TIMEOUT_MS = 1500;
+/** How often the document version is sampled while settling. */
+const SETTLE_TICK_MS = 25;
+/** Consecutive unchanged samples that count as "settled". */
+const SETTLE_STABLE_TICKS = 3;
+/** How many times a refused edit is retried before the write is abandoned. */
+const MAX_FLUSH_ATTEMPTS = 5;
+/** How long to wait before retrying a refused edit. */
+const FLUSH_RETRY_MS = 40;
 
 export class LiveWriter {
   private document: vscode.TextDocument | null = null;
@@ -68,11 +88,22 @@ export class LiveWriter {
   private previousContent = '';
   private buffer = '';
   private written = 0;
+  /**
+   * Every character this writer has successfully put into the document.
+   *
+   * The document's text must equal this at all times. Keeping it lets a flush
+   * notice that the document no longer holds what we wrote — a reload from disk
+   * can do that — and put the missing text back, instead of writing the rest of
+   * the file onto a document that has silently lost its beginning.
+   */
+  private emitted = '';
   private expectedTotal = 0;
   /** Fingerprint of the document as we last left it, to detect manual edits. */
   private lastKnownFingerprint = '';
   private cancelled = false;
   private finished = false;
+  /** True while the developer has held the stream. */
+  private paused = false;
   private flushTimer: NodeJS.Timeout | null = null;
   /** Disposables for the guards installed for the duration of the write. */
   private readonly activeGuards: vscode.Disposable[] = [];
@@ -100,6 +131,40 @@ export class LiveWriter {
 
   get bytesWritten(): number {
     return this.written;
+  }
+
+  /** True while the stream is held, with buffered characters waiting. */
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * Stop putting characters into the document, without ending the write.
+   *
+   * Buffered characters accumulate and are written on `resume()`, so nothing is
+   * lost and nothing already written is undone. Pausing is about how fast the
+   * developer wants to read, not about withholding the code: when the stream
+   * ends, `complete()` writes whatever is still buffered, because a paused write
+   * that has received everything is a finished write.
+   */
+  pause(): void {
+    if (this.finished || this.cancelled || this.paused) {
+      return;
+    }
+    this.paused = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+
+  /** Carry on from where the pause left off. */
+  resume(): void {
+    if (this.finished || this.cancelled || !this.paused) {
+      return;
+    }
+    this.paused = false;
+    this.scheduleFlush();
   }
 
   /**
@@ -171,12 +236,32 @@ export class LiveWriter {
 
     this.lastKnownFingerprint = fingerprint(this.document.getText());
     this.written = 0;
+    this.emitted = '';
     this.buffer = '';
     this.cancelled = false;
     this.finished = false;
     this.expectedTotal = options.expectedTotal ?? 0;
 
+    // Settle before touching anything: see `settleDocument` for why a document
+    // this writer has just created on disk can change under its feet.
+    //
+    // This runs *before* the manual-edit guard is installed, and that order
+    // matters. The reload it is waiting for is delivered as a document change,
+    // and a guard installed first would read it as the developer editing the
+    // file — stopping a write the developer never interfered with.
+    await this.settleDocument(this.document);
+
     this.installManualEditGuard();
+
+    // An `update` replaces the file's content; it does not add to it. The
+    // document is emptied here — through a `WorkspaceEdit`, so the original stays
+    // on VS Code's undo stack — and the proposed content is then streamed into
+    // the empty document. Appending instead left the file holding the original
+    // text *followed by* the new text, which is a file nobody approved and which
+    // the Orchestrator's read-back check then rejects.
+    if (operation === 'update') {
+      await this.clearDocument();
+    }
 
     return {
       document: this.document,
@@ -184,6 +269,67 @@ export class LiveWriter {
       created: this.created,
       previousContent: this.previousContent,
     };
+  }
+
+  /**
+   * Wait for a document to stop changing.
+   *
+   * The version has to stand still for several consecutive samples, not merely
+   * be unchanged once: a single tick of quiet can fall between two reloads.
+   * Bounded, so a document that is being edited by something else cannot stall
+   * the write indefinitely — if it never settles, the write proceeds and the
+   * manual-edit guard decides what to do about it.
+   */
+  private async settleDocument(document: vscode.TextDocument): Promise<void> {
+    const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+    let stable = 0;
+    let last = document.version;
+    while (Date.now() < deadline) {
+      await delay(SETTLE_TICK_MS);
+      if (document.version === last) {
+        stable += 1;
+        if (stable >= SETTLE_STABLE_TICKS) {
+          return;
+        }
+      } else {
+        stable = 0;
+        last = document.version;
+      }
+    }
+    this.deps.logger.warn(
+      `"${this.relativePath}" kept changing while the write was being prepared; writing anyway.`
+    );
+  }
+
+  /**
+   * Empty the target document ahead of an update.
+   *
+   * The original bytes are already held in `previousContent`, which is what
+   * `rollback()` restores, so nothing is lost by clearing the document here.
+   */
+  private async clearDocument(): Promise<void> {
+    const document = this.document;
+    if (!document) {
+      return;
+    }
+    const current = document.getText();
+    if (current.length === 0) {
+      return;
+    }
+    const edit = new vscode.WorkspaceEdit();
+    edit.delete(
+      document.uri,
+      new vscode.Range(document.positionAt(0), document.positionAt(current.length))
+    );
+    this.pendingSelfEdit = true;
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+      throw new Error(
+        `The editor refused to prepare "${this.relativePath}" for the update, so nothing was written and the file is unchanged.`
+      );
+    }
+    await delay(0);
+    this.lastKnownFingerprint = fingerprint(document.getText());
   }
 
   /** Wait for a document to become available after `openTextDocument`. */
@@ -276,7 +422,10 @@ export class LiveWriter {
    * runtime sent.
    */
   private scheduleFlush(): void {
-    if (this.flushTimer) {
+    // While paused the characters keep arriving but nothing is scheduled, so the
+    // timer does not fire and re-arm in a loop for a stream nobody is watching.
+    // `resume()` is what starts it again.
+    if (this.flushTimer || this.paused || this.finished || this.cancelled) {
       return;
     }
     this.flushTimer = setTimeout(() => {
@@ -296,35 +445,98 @@ export class LiveWriter {
   }
 
   private async flush(): Promise<void> {
-    if (this.finished || this.cancelled || !this.document) {
+    if (this.finished || this.cancelled || this.paused || !this.document) {
       return;
     }
-    const chunk = this.buffer;
-    this.buffer = '';
-    if (chunk.length === 0) {
+    if (this.buffer.length === 0) {
       return;
     }
 
-    const document = this.document;
-    const end = document.positionAt(document.getText().length);
-    const edit = new vscode.WorkspaceEdit();
-    edit.insert(document.uri, end, chunk);
+    // The buffer is emptied only once the characters are actually in the
+    // document.
+    //
+    // It used to be cleared before the edit was applied, so a refused edit threw
+    // the chunk away: the file ended up short — and for a `create`, that means
+    // empty — with the only symptom a vague interruption. A refusal is far more
+    // often a stale document version than a read-only file (VS Code rejects an
+    // edit prepared against a version that has since moved), so it is retried
+    // against the document's current state rather than treated as fatal.
+    for (let attempt = 1; attempt <= MAX_FLUSH_ATTEMPTS; attempt += 1) {
+      const document = this.document;
+      if (!document || this.finished || this.cancelled) {
+        return;
+      }
+      const chunk = this.buffer;
+      if (chunk.length === 0) {
+        return;
+      }
 
-    this.pendingSelfEdit = true;
-    const applied = await vscode.workspace.applyEdit(edit);
-    if (!applied) {
+      // What the document holds now should be exactly what we have written. When
+      // it is a truncation of that — a reload from disk can do it while the file
+      // is still empty on disk — the missing text is put back, so the file is
+      // never left with its beginning quietly gone. Anything else means the
+      // document changed for a reason that is not ours.
+      const current = document.getText();
+      let pending = chunk;
+      if (current !== this.emitted) {
+        if (this.emitted.startsWith(current)) {
+          const lost = this.emitted.slice(current.length);
+          this.deps.logger.warn(
+            `"${this.relativePath}" lost ${lost.length} character(s) of written content and they were restored.`
+          );
+          pending = lost + chunk;
+        } else {
+          this.finished = true;
+          this.pendingSelfEdit = false;
+          this.deps.onInterrupted?.(
+            'The file was changed by something other than PairPilot while it was being written, so writing stopped to avoid overwriting your changes.'
+          );
+          return;
+        }
+      }
+
+      const end = document.positionAt(current.length);
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(document.uri, end, pending);
+
+      this.pendingSelfEdit = true;
+      let applied = false;
+      try {
+        applied = await vscode.workspace.applyEdit(edit);
+      } catch (error) {
+        this.deps.logger.warn(
+          `Applying an edit to ${this.relativePath} raised: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+
+      if (applied) {
+        // Only now are the characters ours to discard from the buffer. Anything
+        // pushed while the edit was in flight is still in front of us.
+        this.buffer = this.buffer.slice(chunk.length);
+        this.emitted += pending;
+        // Let the change event settle before re-fingerprinting.
+        await delay(0);
+        this.lastKnownFingerprint = fingerprint(document.getText());
+        this.written = this.emitted.length;
+        this.deps.onProgress?.(this.written, Math.max(this.expectedTotal, this.written));
+        return;
+      }
+
+      // The edit was refused. This writer's own edit cannot have fired the change
+      // event, so clear the flag rather than leave it to swallow the developer's
+      // next keystroke.
       this.pendingSelfEdit = false;
-      this.finished = true;
-      this.deps.onInterrupted?.(
-        'The editor refused the change. The file may be read-only, or another extension may be blocking edits.'
-      );
-      return;
+      if (attempt < MAX_FLUSH_ATTEMPTS) {
+        await delay(FLUSH_RETRY_MS);
+      }
     }
-    // Let the change event settle before re-fingerprinting.
-    await delay(0);
-    this.lastKnownFingerprint = fingerprint(document.getText());
-    this.written += chunk.length;
-    this.deps.onProgress?.(this.written, Math.max(this.expectedTotal, this.written));
+
+    this.finished = true;
+    this.deps.onInterrupted?.(
+      'The editor refused the change. The file may be read-only, or another extension may be blocking edits.'
+    );
   }
 
   /**
@@ -336,6 +548,10 @@ export class LiveWriter {
     if (!this.document) {
       return { status: 'failed', written: 0, reason: 'No write was in progress.' };
     }
+    // A pause is about the pace of the stream, not about withholding content. If
+    // the model has finished, there is nothing left to hold back, so the pause is
+    // lifted and whatever arrived while it was held is written.
+    this.paused = false;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -451,6 +667,7 @@ export class LiveWriter {
     }
     this.buffer = '';
     this.finished = true;
+    this.paused = false;
     // An in-flight flush would otherwise apply an edit after we have reverted,
     // leaving the document with the content we just tried to remove.
     await this.flushQueue;

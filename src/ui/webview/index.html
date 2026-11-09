@@ -98,6 +98,20 @@
       <div class="composer-actions">
         <button id="add-context-button" class="secondary">Add active file</button>
         <span class="spacer"></span>
+        <!--
+          Shown only while a file is being streamed into the editor. Pause holds
+          the stream where it is; "Change this" stops it, takes the partial file
+          back off disk, and asks for the same file written differently.
+        -->
+        <button id="pause-button" class="secondary" hidden>Pause</button>
+        <input
+          id="writing-feedback"
+          type="text"
+          hidden
+          placeholder="What should be different?"
+          aria-label="What should be different about the file being written"
+        />
+        <button id="change-while-writing-button" class="secondary" hidden>Change this</button>
         <button id="cancel-button" class="secondary" disabled>Cancel</button>
         <button id="send-button">Send</button>
       </div>

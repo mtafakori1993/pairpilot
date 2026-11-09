@@ -566,6 +566,61 @@ pre.code {
   opacity: 0.7;
 }
 
+/* The batch panel: every file of a multi-file proposal, each with its own state.
+   Shown above whichever review session is open, so "where are the other six?"
+   has an answer on screen at all times. */
+.batch-panel {
+  margin-bottom: 10px;
+}
+
+.batch-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+  font-size: 0.85em;
+}
+
+.batch-file:last-child {
+  border-bottom: none;
+}
+
+.batch-file-name {
+  flex: 1;
+  font-family: var(--vscode-editor-font-family, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+}
+
+.batch-file-status {
+  flex: 0 0 auto;
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* A file that needs attention reads brighter than one that is merely pending. */
+.batch-file.completed .batch-file-status {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+.batch-file.failed .batch-file-status,
+.batch-file.rejected .batch-file-status {
+  color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.batch-file.approved .batch-file-status {
+  color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.batch-file.pending .batch-file-name,
+.batch-file.approved .batch-file-name {
+  opacity: 0.75;
+}
+
 /* -------------------------------------------------------------- progress -- */
 
 .progress-track {

@@ -60,12 +60,20 @@ export class MessageValidator {
     switch (type) {
       case 'ready':
       case 'cancel':
+      case 'pauseWrite':
+      case 'resumeWrite':
       case 'acceptRecommendation':
       case 'dismissRecommendation':
       case 'newSession':
       case 'addActiveEditorContext':
       case 'revealOutput':
         return { type };
+
+      case 'requestChangesDuringWrite':
+        return {
+          type,
+          feedback: this.requireText(message, 'feedback', MAX_FEEDBACK_LENGTH, 'feedback'),
+        };
 
       case 'submitTask':
         return { type, text: this.requireText(message, 'text', MAX_TEXT_LENGTH, 'task') };
@@ -75,13 +83,14 @@ export class MessageValidator {
           type,
           contentHash: this.requireHash(message, 'contentHash'),
           feedback: this.requireText(message, 'feedback', MAX_FEEDBACK_LENGTH, 'feedback'),
+          ...this.readBinding(message),
         };
 
       case 'approveFileCreation':
       case 'rejectFileCreation':
       case 'approveCode':
       case 'rejectCode':
-        return { type, contentHash: this.requireHash(message, 'contentHash') };
+        return { type, contentHash: this.requireHash(message, 'contentHash'), ...this.readBinding(message) };
 
       case 'loadSession':
       case 'deleteSession': {
@@ -163,5 +172,43 @@ export class MessageValidator {
       );
     }
     return value;
+  }
+
+  /**
+   * Read the optional identity claims a decision may carry.
+   *
+   * These are not trusted — the host checks them against its own record — but
+   * they are still *validated*, because an unvalidated field is a place for a
+   * hostile panel to send something enormous or oddly typed. Anything present
+   * must be exactly the right shape; anything absent is simply not claimed.
+   *
+   * A `proposalVersion` of 0 or a negative number is rejected rather than
+   * ignored: it can only come from a panel that is confused or hostile, and
+   * silently treating it as "no claim" would let such a panel skip the check.
+   */
+  private readBinding(message: Record<string, unknown>): {
+    proposalId?: string;
+    proposalVersion?: number;
+    fileId?: string;
+  } {
+    const binding: { proposalId?: string; proposalVersion?: number; fileId?: string } = {};
+
+    if (message['proposalId'] !== undefined) {
+      binding.proposalId = this.requireString(message, 'proposalId', MAX_ID_LENGTH);
+    }
+    if (message['fileId'] !== undefined) {
+      binding.fileId = this.requireString(message, 'fileId', MAX_ID_LENGTH);
+    }
+    if (message['proposalVersion'] !== undefined) {
+      const version = message['proposalVersion'];
+      if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
+        throw new MessageRejectedError(
+          'Field "proposalVersion" must be a positive integer when present.'
+        );
+      }
+      binding.proposalVersion = version;
+    }
+
+    return binding;
   }
 }

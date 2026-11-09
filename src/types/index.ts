@@ -506,16 +506,55 @@ export interface AdvisorRecommendation {
 /* Webview protocol                                                           */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * What a decision claims about the proposal it is deciding on.
+ *
+ * The `contentHash` on each decision already binds it to exact bytes. These
+ * fields add the *identity* half of the binding — which proposal, which version
+ * of it, and which file — so a decision can be refused not only when the bytes
+ * changed but when it is being applied to the wrong member of a batch. All three
+ * are optional so that a panel which only knows the hash still works; anything
+ * the panel does state is checked against the host's own record.
+ */
+export interface DecisionBindingFields {
+  /** The proposal the developer was shown. */
+  proposalId?: string;
+  /** The version of that proposal. Counts revisions, so a stale value is refused. */
+  proposalVersion?: number;
+  /** The individual file, for a per-file decision. */
+  fileId?: string;
+}
+
 /** Messages sent from the Webview to the Extension Host. */
 export type WebviewRequest =
   | { type: 'ready' }
   | { type: 'submitTask'; text: string }
   | { type: 'cancel' }
-  | { type: 'approveFileCreation'; contentHash: string }
-  | { type: 'rejectFileCreation'; contentHash: string }
-  | { type: 'approveCode'; contentHash: string }
-  | { type: 'rejectCode'; contentHash: string }
-  | { type: 'requestChanges'; contentHash: string; feedback: string }
+  /**
+   * Hold and release the stream into the editor while a file is being written.
+   *
+   * Separate from `cancel`: pausing keeps the turn and the partial write, so the
+   * developer can read what has arrived and then either let it continue or ask
+   * for it to be different.
+   */
+  | { type: 'pauseWrite' }
+  | { type: 'resumeWrite' }
+  /**
+   * Ask for this file to be written differently, while it is still arriving.
+   *
+   * The mid-stream counterpart of `requestChanges`: the partial content is taken
+   * back off disk and the feedback becomes a revision request for the same file.
+   */
+  | { type: 'requestChangesDuringWrite'; feedback: string }
+  | ({ type: 'approveFileCreation'; contentHash: string } & DecisionBindingFields)
+  | ({ type: 'rejectFileCreation'; contentHash: string } & DecisionBindingFields)
+  | ({ type: 'approveCode'; contentHash: string } & DecisionBindingFields)
+  | ({ type: 'rejectCode'; contentHash: string } & DecisionBindingFields)
+  | ({
+      type: 'requestChanges';
+      contentHash: string;
+      feedback: string;
+    } & DecisionBindingFields)
   | { type: 'acceptRecommendation' }
   | { type: 'dismissRecommendation' }
   | { type: 'newSession' }
@@ -558,6 +597,35 @@ export interface WebviewStateSnapshot {
   /** Every file the proposal intends to write, in the order it will write them. */
   changePlan: { file: string; operation: string; description: string; risk: string }[];
   /**
+   * The multi-file batch in flight, or null when there is no open batch.
+   *
+   * Sent so the panel can show each file's own state — pending, authorised,
+   * written, failed, under revision — without holding any of it itself. The
+   * host remains the only authority on the batch; a reload of the panel
+   * re-reads this and shows the same picture, because nothing about the batch
+   * ever lived in the Webview.
+   */
+  batch: BatchViewSnapshot | null;
+  /**
+   * The identity of whatever is currently awaiting a decision.
+   *
+   * The panel echoes this back with the decision so the host can refuse one that
+   * is about a proposal version or a file the developer is no longer looking at.
+   * Null when nothing is pending — which is itself information, because a
+   * decision that arrives with no binding to echo is treated as unclaimed rather
+   * than as a claim about nothing.
+   */
+  reviewBinding: { proposalId: string; proposalVersion: number; fileId: string } | null;
+  /**
+   * True while the developer has held the stream into the editor.
+   *
+   * Sent so the panel's Pause control reads Resume after a reload, rather than
+   * offering to pause something that is already paused.
+   */
+  writePaused: boolean;
+  /** The file currently being streamed into the editor, or null. */
+  writingFile: string | null;
+  /**
    * Which kind of work the session is doing, and why.
    *
    * Owned by the extension host and sent down like any other state, never held
@@ -583,6 +651,32 @@ export interface ContextFileSummary {
   truncated: boolean;
   /** True when the developer approved a sensitive file for this request. */
   sensitive: boolean;
+}
+
+/**
+ * The multi-file batch as the panel sees it.
+ *
+ * Deliberately metadata only — no file content crosses this boundary in the
+ * snapshot. The proposed code reaches the developer through the real editor,
+ * which is the whole point of streaming into the file rather than into a
+ * preview.
+ */
+export interface BatchViewSnapshot {
+  batchId: string;
+  proposalId: string;
+  proposalVersion: number;
+  total: number;
+  authorized: number;
+  completed: number;
+  pending: number;
+  failed: number;
+  files: {
+    fileId: string;
+    file: string;
+    operation: string;
+    status: string;
+    note?: string;
+  }[];
 }
 
 export interface SessionSummary {

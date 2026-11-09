@@ -15,19 +15,59 @@ AI proposes  →  Human reviews  →  AI writes  →  Human approves  →  AI re
 Every turn moves through explicit, visible states:
 
 1. **Send a task** in the PairPilot sidebar.
-2. The model returns a **structured proposal** — target path, operation
-   (`create` or `update`), and the code.
-3. Government of the target path is checked before you ever see it: it must be
+2. The model returns a **structured proposal** — one or more files, each with a
+   target path, an operation (`create` or `update`), and its code.
+3. Government of every target path is checked before you ever see it: it must be
    inside the workspace, must not be in a dependency or build directory, and must
    not be a credential.
-4. **You approve the creation.** Nothing has been written yet.
-5. The file is created **empty**, opened in the real editor, and the approved code
-   is **streamed in progressively** as the model produces it.
-6. **You approve the final code.** Only then does the state advance.
+4. **You approve the batch.** Nothing has been written yet.
+5. Each file is created **empty**, opened in the **real editor**, and the approved
+   code is **streamed in progressively** as the model produces it. Watch it being
+   written, then read and edit it with the ordinary VS Code tooling.
+6. **You approve the final code, file by file.** Reject or request changes on one
+   file and its siblings are untouched.
 7. The **Engineering Advisor** recommends exactly one next step.
 
-Reject at either gate and the write is rolled back — a created file is deleted, an
-updated file is restored to its previous content.
+Reject at either gate and that write is rolled back — a created file is deleted,
+an updated file is restored to its previous content.
+
+### Reviewing in the editor, not the panel
+
+The code is reviewed where it lives. The proposed file is opened in the actual
+VS Code editor and written into it a chunk at a time, so you see the file
+appearing rather than a preview of it. Generated code carries **Persian comments**
+explaining each class, method and non-obvious block — what it does and why — with
+identifiers, keywords and error messages left in the language of the code.
+
+While a file is streaming you can:
+
+- **Pause** — hold the stream where it is. What has already been written stays;
+  pausing is not an undo.
+- **Change this** — take the partial file back off disk and turn your feedback
+  into a revision of *this* file.
+- **Cancel** — stop the turn and roll the file back.
+
+Each file's review is independent. Revising `create.ts` does not disturb
+`index.php`, and two sessions cannot write the same path at once.
+
+Nothing is ever overwritten without authorisation: an existing file is replaced
+only by an `update` proposal you approved, and a `create` over an existing file is
+refused outright.
+
+### The batch record
+
+A multi-file proposal gets a persistent record, held by the Extension Host and
+rendered by the panel: a batch id, the proposal id and version, and for each file
+its id, path, operation, content hash, status (`pending`, `writing`, `completed`,
+`failed`) and any note. The panel does not own this — reload it and the same
+picture comes back.
+
+Decisions are bound to that record, not just to the bytes. A decision may state
+which proposal, which version and which file it is deciding on, and each is
+checked against the host's own store: a superseded version is refused, a file id
+from a different proposal is refused, and the file that gets written is the one
+the host has on record. The host never treats "approved" as sufficient on its own,
+and never creates a placeholder file in place of content that did not arrive.
 
 ## Workflow modes: planning never becomes coding by accident
 
@@ -318,9 +358,9 @@ Development Host.
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 791 unit and security tests
+npm test                 # 1005 unit and security tests
 npm run test:live        # opt-in: 8 real-CLI protocol tests
-npm run test:vscode      # opt-in: 9 extension-host tests
+npm run test:vscode      # opt-in: 12 extension-host tests
 npm run package          # production build + VSIX
 ```
 
@@ -360,6 +400,14 @@ a create writes code into a **real** `TextDocument` progressively (not one paste
 that a large stream lands byte-identically, and that both rollback paths — delete
 a created file, restore an updated one — behave.
 
+It also covers the multi-file path, because that is where the reported failures
+were and the batch ledger's bookkeeping is only half the story: **all seven files
+of a batch are written into the real workspace** and read back from disk, a
+**rejection rolls back one file and leaves the other six exactly as they were**,
+and **two review sessions cannot write the same path at once**. The rollback case
+asserts the `TextDocument` holds the proposed code and nothing else, which is what
+catches an `update` that appends instead of replacing.
+
 It launches the **Electron binary** (`VSCode-linux-x64/code`), not the `bin/code`
 wrapper. The wrapper runs `resources/app/out/cli.js`, which hands the request to a
 GUI process and exits immediately, so a run against it reports success having
@@ -383,6 +431,25 @@ Worth recording, because it is the argument for having them:
   offset and *then* awaits `applyEdit`, so two overlapping flushes can insert out
   of order. The 40ms debounce usually separates them; under load it does not. The
   fix serialises flushes; the progressive-write test fails without it.
+- **An approved batch of seven wrote one file and lost six.** Requesting changes
+  to a single file sent the turn back through the proposal stage, which rebuilt
+  the batch from a reply that contained one file. The other six vanished from the
+  ledger, so the next authorization had nothing to resolve content from — and the
+  reported symptom, "no file contents were sent", was the *correct* refusal at the
+  end of a pipeline that had already lost the content two stages earlier. The unit
+  tests for the batch all passed throughout, because the defect was in how the
+  Orchestrator *called* the queue, not in the queue.
+- **A refused `WorkspaceEdit` dropped the chunk.** VS Code refuses an edit whose
+  document moved in the meantime — which creating the file itself causes. `flush()`
+  cleared its buffer before applying, so the refused characters existed nowhere,
+  and the stream reported success having written less than the proposal. The
+  buffer is now consumed only after a successful apply, and the writer waits for the
+  document to settle before installing its manual-edit guard.
+- **Every `update` rolled back as a failure.** The writer inserted at the end of
+  the document while the old content was still in it, so the file on disk never
+  matched the proposal and the read-back verification rejected it. An `update`
+  could not succeed at all. Only the editor-host suite could see this, because the
+  defect is in what a real `TextDocument` contains after an edit.
 
 ## Architecture
 

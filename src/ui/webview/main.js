@@ -258,9 +258,16 @@
 
     const files = snapshot.lastContextFiles || [];
     if (files.length === 0) {
+      // This panel is about the *workspace context sent to the model*, which is
+      // a different thing from the files of a proposal. The old wording — "No
+      // file contents were sent with the last request." — said neither, and
+      // sitting under a seven-file proposal it read as though the proposal had
+      // lost its files. It had not; this list was simply empty, which is the
+      // normal state when a request needed no surrounding context.
       const none = document.createElement('span');
       none.className = 'hint';
-      none.textContent = 'No file contents were sent with the last request.';
+      none.textContent =
+        'No workspace files were needed as context for the last request. This list is about code sent to the AI, not the files it proposes to write.';
       container.appendChild(none);
     } else {
       for (const file of files) {
@@ -336,6 +343,15 @@
     const container = el('review-content');
     container.textContent = '';
 
+    // The batch always comes first when there is one, so the developer can see
+    // all seven files, what state each is in, and jump to any of them. This is
+    // the "each file's review is independent" requirement made visible: the list
+    // is drawn from the host's record, not from what this panel has watched
+    // happen, so it survives a reload intact.
+    if (snapshot.batch && snapshot.batch.total > 1) {
+      container.appendChild(buildBatchPanel(snapshot.batch));
+    }
+
     // Stage 1: permission to create or update the file. Nothing exists yet for
     // a create, so this gate is about the path, not the content.
     if (snapshot.state === 'WAITING_FILE_APPROVAL' && snapshot.pendingFilePath) {
@@ -345,6 +361,9 @@
 
     const proposal = snapshot.activeProposal;
     if (!proposal) {
+      if (snapshot.batch && snapshot.batch.total > 1) {
+        return;
+      }
       const empty = document.createElement('div');
       empty.className = 'empty';
       empty.textContent = 'No code proposal is awaiting review.';
@@ -353,6 +372,84 @@
     }
 
     container.appendChild(buildReviewCard(proposal));
+  }
+
+  /** Human wording and a css class for each batch file state. */
+  const BATCH_STATUS = {
+    pending: 'waiting',
+    authorized: 'authorised to write',
+    writing: 'writing now',
+    completed: 'awaiting your review',
+    approved: 'approved',
+    failed: 'could not be written',
+    revision: 'being revised',
+    rejected: 'rejected',
+  };
+
+  /**
+   * The seven files of a batch, each with its own state.
+   *
+   * Every value here is host-supplied, and the file names are model-supplied, so
+   * everything goes in with textContent. A file already written can be opened in
+   * the editor from here, which is the point of reviewing in the real editor
+   * rather than in a preview.
+   */
+  function buildBatchPanel(batch) {
+    const card = document.createElement('div');
+    card.className = 'card batch-panel';
+
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    title.textContent =
+      'This proposal writes ' +
+      batch.total +
+      ' files — ' +
+      batch.completed +
+      ' written, ' +
+      batch.pending +
+      ' to go';
+    card.appendChild(title);
+
+    if (batch.failed > 0) {
+      const warning = document.createElement('div');
+      warning.className = 'warning-box';
+      warning.textContent =
+        batch.failed + ' file(s) could not be written. The others are unaffected.';
+      card.appendChild(warning);
+    }
+
+    for (const file of batch.files) {
+      const row = document.createElement('div');
+      row.className = 'batch-file ' + file.status;
+
+      const name = document.createElement('span');
+      name.className = 'batch-file-name';
+      name.textContent = file.file;
+      name.setAttribute('dir', 'ltr');
+      name.title = file.note ? file.file + ' — ' + file.note : file.file;
+      row.appendChild(name);
+
+      const status = document.createElement('span');
+      status.className = 'batch-file-status';
+      status.textContent = BATCH_STATUS[file.status] || file.status;
+      row.appendChild(status);
+
+      // Written files can be opened for review in the real editor; the rest have
+      // nothing to open yet.
+      if (file.status === 'completed' || file.status === 'approved') {
+        const open = document.createElement('button');
+        open.className = 'link';
+        open.textContent = 'Open';
+        open.addEventListener('click', () => {
+          post({ type: 'openFile', relativePath: file.file });
+        });
+        row.appendChild(open);
+      }
+
+      card.appendChild(row);
+    }
+
+    return card;
   }
 
   function buildFileApprovalGate() {
@@ -424,7 +521,7 @@
           ? 'Allow update'
           : 'Allow creation';
     approve.addEventListener('click', () => {
-      post({ type: 'approveFileCreation', contentHash: currentHash() });
+      post(decision('approveFileCreation'));
     });
     actions.appendChild(approve);
 
@@ -438,7 +535,15 @@
       approveAll.textContent =
         'Allow all ' + remaining + ' remaining file' + (remaining === 1 ? '' : 's');
       approveAll.addEventListener('click', () => {
-        post({ type: 'approveFileCreation', contentHash: progress.setId });
+        // The set hash, not a file hash: this authorises the remaining files by
+        // identity, and the version it echoes is the one on screen. The host
+        // authorises *writing*; each file is still reviewed afterwards.
+        post(
+          Object.assign(
+            { type: 'approveFileCreation', contentHash: progress.setId },
+            binding()
+          )
+        );
       });
       actions.appendChild(approveAll);
     }
@@ -447,7 +552,7 @@
     reject.className = 'secondary';
     reject.textContent = 'Decline';
     reject.addEventListener('click', () => {
-      post({ type: 'rejectFileCreation', contentHash: currentHash() });
+      post(decision('rejectFileCreation'));
     });
     actions.appendChild(reject);
 
@@ -475,6 +580,28 @@
    */
   function currentHash() {
     return (snapshot && snapshot.activeProposal && snapshot.activeProposal.contentHash) || '';
+  }
+
+  /**
+   * The identity to echo back with a decision.
+   *
+   * The hash answers *what bytes*; this answers *which file, in which version of
+   * which proposal*. Both go with every decision so the host can refuse one that
+   * has gone stale in either sense, and can tell which of seven files it applies
+   * to. A missing binding is sent as nothing rather than as empty strings, so the
+   * host sees "no claim" and not "a claim about an empty id".
+   */
+  function binding() {
+    const b = snapshot && snapshot.reviewBinding;
+    if (!b) {
+      return {};
+    }
+    return { proposalId: b.proposalId, proposalVersion: b.proposalVersion, fileId: b.fileId };
+  }
+
+  /** One decision message: hash + identity, always together. */
+  function decision(type, extra) {
+    return Object.assign({ type: type, contentHash: currentHash() }, binding(), extra || {});
   }
 
   function buildReviewCard(proposal) {
@@ -591,7 +718,7 @@
     const approve = document.createElement('button');
     approve.textContent = 'Approve';
     approve.addEventListener('click', () => {
-      post({ type: 'approveCode', contentHash: proposal.contentHash });
+      post(decision('approveCode'));
     });
     actions.appendChild(approve);
 
@@ -599,7 +726,7 @@
     reject.className = 'danger';
     reject.textContent = 'Reject';
     reject.addEventListener('click', () => {
-      post({ type: 'rejectCode', contentHash: proposal.contentHash });
+      post(decision('rejectCode'));
     });
     actions.appendChild(reject);
 
@@ -611,11 +738,12 @@
         window.alert('Describe the changes you want before requesting a revision.');
         return;
       }
-      post({
-        type: 'requestChanges',
-        contentHash: proposal.contentHash,
-        feedback: drafts.feedback,
-      });
+      post(
+        decision('requestChanges', {
+          contentHash: proposal.contentHash,
+          feedback: drafts.feedback,
+        })
+      );
       drafts.feedback = '';
     });
     actions.appendChild(revise);
@@ -809,12 +937,33 @@
     const busy = snapshot.isStreaming;
     const awaiting = snapshot.pendingApproval || Boolean(snapshot.activeProposal);
 
+    // The two mid-stream controls exist only while a file is going into the
+    // editor. Everywhere else there is no stream to hold and no partial file to
+    // take back, and showing them greyed out would advertise something the host
+    // would refuse.
+    const writing = Boolean(snapshot.writingFile);
+    const paused = Boolean(snapshot.writePaused);
+
     el('send-button').disabled = busy;
     el('cancel-button').disabled = !busy;
     textarea.disabled = busy;
 
+    const pauseButton = el('pause-button');
+    pauseButton.hidden = !writing;
+    pauseButton.textContent = paused ? 'Resume' : 'Pause';
+    pauseButton.setAttribute(
+      'aria-label',
+      paused ? 'Resume writing the file' : 'Pause writing the file'
+    );
+    el('change-while-writing-button').hidden = !writing;
+    el('writing-feedback').hidden = !writing;
+
     const hint = el('composer-hint');
-    if (busy) {
+    if (writing && paused) {
+      hint.textContent = `Paused at ${snapshot.writingFile}. Nobody is writing to the file while it is paused; the rest arrives when you resume.`;
+    } else if (writing) {
+      hint.textContent = `${snapshot.writingFile} is being written into the editor. Pause to read it, or Change this to have it written differently.`;
+    } else if (busy) {
       hint.textContent = 'PairPilot is working. Use Cancel to stop and roll back any partial write.';
     } else if (awaiting) {
       hint.textContent = 'Resolve the review in the Review tab before starting another task.';
@@ -872,6 +1021,25 @@
 
     el('send-button').addEventListener('click', send);
     el('cancel-button').addEventListener('click', () => post({ type: 'cancel' }));
+    el('pause-button').addEventListener('click', () =>
+      post(snapshot.writePaused ? { type: 'resumeWrite' } : { type: 'pauseWrite' })
+    );
+    el('change-while-writing-button').addEventListener('click', () => {
+      // The feedback box is the composer's own, not a `window.prompt`: VS Code
+      // webviews run sandboxed and a modal prompt is silently ignored there,
+      // which would make this button appear to do nothing at all.
+      const trimmed = el('writing-feedback').value.trim();
+      if (trimmed.length === 0) {
+        window.alert('Describe what should be different before asking for a change.');
+        el('writing-feedback').focus();
+        return;
+      }
+      drafts.feedback = trimmed;
+      // Reuses the same request as the post-write "Request changes", so saying
+      // "not like that" means the same thing whenever it is said. The host takes
+      // the partial file back off disk first, because this write never finished.
+      post({ type: 'requestChangesDuringWrite', feedback: trimmed });
+    });
     el('add-context-button').addEventListener('click', () =>
       post({ type: 'addActiveEditorContext' })
     );

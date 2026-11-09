@@ -160,6 +160,13 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
       // the set machinery at all rather than rendering a permanent "1 of 1".
       changeProgress: orchestrator.changeProgressValue,
       changePlan: orchestrator.changeSetPlanValue,
+      // The batch's own record, straight from the host. The panel renders this
+      // rather than accumulating what it has seen, so a reload shows the same
+      // seven files with the same states instead of an empty list.
+      batch: orchestrator.batchView,
+      reviewBinding: orchestrator.reviewBindingValue,
+      writePaused: orchestrator.writePausedValue,
+      writingFile: orchestrator.writingFileValue,
       workflowMode: orchestrator.workflowModeView,
       usage: session?.usage ?? {
         inputTokens: 0,

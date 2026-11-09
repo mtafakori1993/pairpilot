@@ -8,8 +8,17 @@
  *   - the extension activates,
  *   - the sidebar view and every command are registered,
  *   - runtime detection reaches the real CLI from inside the host,
- *   - a file is created and code is written into the actual editor, and
- *   - a rejected write rolls the file back off disk.
+ *   - a file is created and code is written into the actual editor,
+ *   - a rejected write rolls the file back off disk — and, for a multi-file
+ *     proposal, rolls back only its own file,
+ *   - a seven-file batch is written through the real editor to the real file
+ *     system, one file at a time, with each file's bytes verified on disk, and
+ *   - a per-path write lock keeps two review sessions off the same file.
+ *
+ * The batch cases exist because the multi-file path is where a unit test is
+ * weakest: the Orchestrator's bookkeeping can be asserted against a mocked
+ * `vscode`, but `WorkspaceEdit`, `TextDocument` and the file system cannot. What
+ * is asserted here is the layer those tests cannot reach.
  *
  * A tiny runner is used instead of Mocha: the suite needs a promise that rejects
  * on the first failure and nothing else, and pulling in a full test framework
@@ -23,7 +32,11 @@ import * as vscode from 'vscode';
 
 import { PathGuard } from '../../../src/security/PathGuard';
 import { LiveWriter } from '../../../src/editor/LiveWriter';
-import type { Logger } from '../../../src/types';
+import { ProposalValidator } from '../../../src/proposals/ProposalValidator';
+import { BatchQueue } from '../../../src/proposals/BatchQueue';
+import { PAIRPILOT_PROTOCOL_VERSION } from '../../../src/protocol/types';
+import type { CodeProposalMessage, ProposalChange } from '../../../src/protocol/types';
+import type { Logger, ValidatedChange } from '../../../src/types';
 
 /**
  * Must match `publisher.name` from package.json. A stale value here makes
@@ -65,6 +78,132 @@ function requireWorkspaceRoot(): string {
   const folder = vscode.workspace.workspaceFolders?.[0];
   assert.ok(folder, 'the suite needs a workspace folder to be open');
   return folder.uri.fsPath;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The seven-file batch, written by the real extension host                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A folder the batch cases own, so their files can be removed wholesale and
+ * cannot collide with a developer's own sources.
+ */
+const BATCH_DIR = 'src/suite-batch';
+
+const BATCH_FILES = [
+  'index.ts',
+  'create.ts',
+  'list.ts',
+  'edit.ts',
+  'delete.ts',
+  'db.ts',
+  'helpers.ts',
+] as const;
+
+/**
+ * Seven `create` changes, in the shape a model actually sends.
+ *
+ * The contents are deliberately distinct and self-identifying: a run that
+ * conflated two files, or wrote one file's content into another's path, would
+ * still produce seven non-empty files, so "seven files exist" is not by itself
+ * evidence of anything.
+ */
+function batchChanges(): ProposalChange[] {
+  return BATCH_FILES.map((file, index) => ({
+    id: `change-${index + 1}`,
+    file: `${BATCH_DIR}/${file}`,
+    operation: 'create',
+    description: `File ${index + 1} of the batch.`,
+    content: `// ${file}\nexport const which = ${index};\n`,
+    dependencies: [],
+    risk: 'low',
+  }));
+}
+
+function batchMessage(): CodeProposalMessage {
+  return {
+    protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+    type: 'code_proposal',
+    message: 'Seven files.',
+    task: { title: 'Batch', description: 'Seven files, written by the host.' },
+    changes: batchChanges(),
+  } as CodeProposalMessage;
+}
+
+/**
+ * Drive one file from the batch into the real editor and onto disk.
+ *
+ * This mirrors what `Orchestrator.applyChange` does for one file — take the
+ * per-path write lock, stream the reviewed content through a real `LiveWriter`,
+ * wait for the write, then confirm the bytes actually landed — but runs inside
+ * the extension host, so the `WorkspaceEdit`, the real `TextDocument` and the
+ * real file system are all genuine rather than mocked.
+ */
+async function writeOneFromBatch(
+  batch: BatchQueue,
+  entry: ValidatedChange,
+  guard: PathGuard
+): Promise<{ relativePath: string; absolutePath: string; onDisk: string }> {
+  const relativePath = entry.relativePath;
+  const absolutePath = path.join(requireWorkspaceRoot(), relativePath);
+
+  // One writer per path, exactly as the Orchestrator enforces it.
+  assert.ok(batch.claimWrite(relativePath), `the write lock for ${relativePath} should be free`);
+  batch.markWriting(relativePath);
+
+  const writer = new LiveWriter({ guard, logger });
+  try {
+    await writer.begin(relativePath, 'create', {
+      approvedCreate: true,
+      expectedTotal: entry.assembledCode.length,
+    });
+
+    // Push in small chunks so the write is progressive, the way a streamed
+    // model reply arrives. Each chunk is followed by a real pause so the
+    // writer's flush debounce cannot coalesce the whole file into one edit —
+    // otherwise this would not distinguish a streamed write from a paste.
+    const code = entry.assembledCode;
+    const chunks = code.match(/[\s\S]{1,16}/g) ?? [];
+    for (const chunk of chunks) {
+      writer.push(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const outcome = await writer.complete();
+    assert.strictEqual(
+      outcome.status,
+      'completed',
+      `writing ${relativePath} did not complete: ${JSON.stringify(outcome)}`
+    );
+  } finally {
+    batch.releaseWrite(relativePath);
+  }
+
+  const onDisk = fs.readFileSync(absolutePath, 'utf8');
+  batch.markCompleted(relativePath);
+  return { relativePath, absolutePath, onDisk };
+}
+
+/**
+ * Close every editor showing a file under the batch folder.
+ *
+ * The writers open real editors, and an editor left holding a document for a
+ * file the next case deletes and recreates makes VS Code reload that document —
+ * a change the manual-edit guard correctly reads as "modified outside
+ * PairPilot" and stops the write for. That is the guard doing its job on a
+ * situation no developer would create, so the cases clean up after themselves
+ * rather than the product learning to ignore a real signal.
+ */
+async function closeBatchEditors(): Promise<void> {
+  const root = requireWorkspaceRoot();
+  const prefix = path.join(root, BATCH_DIR);
+  const open = vscode.window.visibleTextEditors.filter((editor) =>
+    editor.document.uri.fsPath.startsWith(prefix)
+  );
+  for (const editor of open) {
+    await vscode.window.showTextDocument(editor.document, { preview: false });
+    await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  }
 }
 
 const cases: Case[] = [
@@ -328,15 +467,35 @@ const cases: Case[] = [
       // the rejection has to put the original bytes back. This is the update
       // counterpart of the create rollback above, and the reason the writer
       // caches `previousContent` before touching anything.
-      await writer.begin(relativePath, 'update', { approvedCreate: false, expectedTotal: 50 });
-      writer.push('export const existing = false; // rejected by the suite\n');
+      const proposed = 'export const existing = false; // rejected by the suite\n';
+      const begun = await writer.begin(relativePath, 'update', {
+        approvedCreate: false,
+        expectedTotal: proposed.length,
+      });
+      writer.push(proposed);
       const outcome = await writer.complete();
       assert.strictEqual(outcome.status, 'completed', 'the update should have completed');
+
+      // The document must hold the proposed content and nothing else. An update
+      // *replaces* the file rather than adding to it, and this is what the
+      // Orchestrator relies on when it reads the file back and compares it with
+      // the proposal: any other result — the original text with the new text
+      // appended, say — is a file the developer did not approve.
+      assert.strictEqual(
+        begun.document.getText(),
+        proposed,
+        'an update must leave the file holding exactly the proposed content'
+      );
 
       assert.notStrictEqual(
         fs.readFileSync(absolutePath, 'utf8'),
         original,
         'the update should have changed the file before the rollback'
+      );
+      assert.strictEqual(
+        fs.readFileSync(absolutePath, 'utf8'),
+        proposed,
+        'the bytes on disk after an update must be the proposed content'
       );
 
       const rollback = await writer.rollback('rejected');
@@ -346,6 +505,257 @@ const cases: Case[] = [
         original,
         'the rejected update must restore the exact previous bytes'
       );
+    },
+  },
+
+  {
+    name: 'all seven files of a batch are written into the real workspace',
+    async run() {
+      const root = requireWorkspaceRoot();
+      const guard = new PathGuard(root, { allowSensitiveFiles: false });
+      const batchDir = path.join(root, BATCH_DIR);
+
+      // Start from a clean slate so "the file exists" cannot be satisfied by a
+      // leftover from an earlier run, and with no editor holding a document for
+      // a file that is about to be recreated.
+      await closeBatchEditors();
+      fs.rmSync(batchDir, { recursive: true, force: true });
+
+      // The real validator, against the real file system, so the change set this
+      // writes is the same one the extension would have produced from a model
+      // reply — not a hand-built fixture that could differ in a field that
+      // matters.
+      const set = new ProposalValidator(guard).validateChangeSet(batchMessage());
+      assert.strictEqual(set.changes.length, 7, 'the validator should accept all seven files');
+
+      const batch = BatchQueue.create(set);
+      assert.strictEqual(batch.size, 7, 'the batch should hold all seven files');
+
+      // The developer approves the set once: "write all remaining files".
+      const authorised = batch.authorizeRemaining();
+      assert.strictEqual(authorised.length, 7, 'one batch decision should cover all seven files');
+
+      // Authorising is permission to write, not evidence of writing. Before any
+      // file is written, all seven must still be outstanding — otherwise the
+      // batch would consider itself finished having written nothing.
+      assert.strictEqual(batch.nextPending() !== undefined, true, 'there should be a file to write');
+      assert.strictEqual(batch.counts().pending, 7, 'all seven should still be outstanding');
+      assert.strictEqual(batch.counts().completed, 0, 'nothing should be written yet');
+
+      const seen: string[] = [];
+      for (const [index, entry] of set.changes.entries()) {
+        const result = await writeOneFromBatch(batch, entry, guard);
+
+        // The bytes on disk are this file's content and nobody else's. Comparing
+        // against the validated content rather than a literal is what makes this
+        // a check on the whole path from validator to file system.
+        assert.strictEqual(
+          result.onDisk,
+          entry.assembledCode,
+          `${result.relativePath} on disk does not match the reviewed content.\n` +
+            `  expected: ${JSON.stringify(entry.assembledCode)}\n` +
+            `  actual  : ${JSON.stringify(result.onDisk)}`
+        );
+        seen.push(result.relativePath);
+
+        // Nothing later in the batch has been written yet. This is the property
+        // the batch depends on — one file at a time, in order, so a per-file
+        // decision has exactly one file to be about.
+        for (const later of set.changes.slice(index + 1)) {
+          assert.ok(
+            !fs.existsSync(path.join(root, later.relativePath)),
+            `${later.relativePath} should not have been written yet, while writing ${result.relativePath}`
+          );
+        }
+
+        // And everything written before it is still exactly as it was left.
+        for (const earlier of seen) {
+          const earlierEntry = set.changes.find((change) => change.relativePath === earlier)!;
+          assert.strictEqual(
+            fs.readFileSync(path.join(root, earlier), 'utf8'),
+            earlierEntry.assembledCode,
+            `${earlier} was disturbed by writing ${result.relativePath}`
+          );
+        }
+      }
+
+      // All seven, in order, each written exactly once.
+      assert.deepStrictEqual(
+        seen,
+        set.changes.map((change) => change.relativePath),
+        'every file should have been written, in the order proposed'
+      );
+
+      // And all seven are really on disk afterwards — the assertion the original
+      // report failed, where seven files were approved and one was written.
+      const onDisk = fs
+        .readdirSync(batchDir)
+        .filter((name) => name.endsWith('.ts'))
+        .sort();
+      assert.strictEqual(
+        onDisk.length,
+        7,
+        `expected all seven files on disk, found ${onDisk.length}: ${JSON.stringify(onDisk)}`
+      );
+
+      // The batch record agrees with the file system rather than the other way
+      // round, and is what a reloaded panel would render from.
+      const view = batch.view();
+      assert.strictEqual(view.total, 7, 'the batch should still report seven files');
+      assert.strictEqual(view.completed, 7, 'the batch should report seven files written');
+      assert.strictEqual(view.failed, 0, 'no file should have failed');
+      assert.ok(
+        view.files.every((file) => file.status === 'completed'),
+        `every file should be awaiting its own review, got ${JSON.stringify(
+          view.files.map((file) => `${file.file}:${file.status}`)
+        )}`
+      );
+
+      await closeBatchEditors();
+      fs.rmSync(batchDir, { recursive: true, force: true });
+    },
+  },
+
+  {
+    name: 'rejecting one file of a batch rolls it back and leaves the other six alone',
+    async run() {
+      const root = requireWorkspaceRoot();
+      const guard = new PathGuard(root, { allowSensitiveFiles: false });
+      const batchDir = path.join(root, BATCH_DIR);
+
+      await closeBatchEditors();
+      fs.rmSync(batchDir, { recursive: true, force: true });
+
+      const set = new ProposalValidator(guard).validateChangeSet(batchMessage());
+      const batch = BatchQueue.create(set);
+      batch.authorizeRemaining();
+
+      // Write the first three, then reject the fourth.
+      const written = [];
+      for (const entry of set.changes.slice(0, 3)) {
+        written.push(await writeOneFromBatch(batch, entry, guard));
+      }
+
+      const rejected = set.changes[3]!;
+      assert.ok(batch.claimWrite(rejected.relativePath), 'the lock should be free before the write');
+      const writer = new LiveWriter({ guard, logger });
+      await writer.begin(rejected.relativePath, 'create', { approvedCreate: true });
+      writer.push(`${rejected.assembledCode}// rejected by the developer\n`);
+      const outcome = await writer.complete();
+      assert.strictEqual(outcome.status, 'completed', 'the rejected write should have completed first');
+      batch.releaseWrite(rejected.relativePath);
+      batch.markCompleted(rejected.relativePath);
+
+      const rejectedPath = path.join(root, rejected.relativePath);
+      assert.ok(fs.existsSync(rejectedPath), 'the file should exist before the rejection');
+
+      // The developer rejects this file's content: it is rolled back, and the
+      // other six must not be affected in any way. This is the case the reported
+      // bug broke — a per-file decision used to discard the whole remaining set.
+      const rollback = await writer.rollback('rejected');
+      assert.ok(rollback, 'rollback should report an outcome');
+      batch.markRejected(rejected.relativePath, 'wrong approach');
+      await waitFor(
+        () => !fs.existsSync(rejectedPath),
+        'the rejected file to be removed from disk'
+      );
+
+      // Every already-written file is still present, byte for byte.
+      for (const result of written) {
+        assert.ok(fs.existsSync(result.absolutePath), `${result.relativePath} should still exist`);
+        assert.strictEqual(
+          fs.readFileSync(result.absolutePath, 'utf8'),
+          result.onDisk,
+          `${result.relativePath} was disturbed by the rejection of ${rejected.relativePath}`
+        );
+      }
+
+      // The batch still knows about the three files that have not been written
+      // yet. Under the old behaviour they were gone at this point.
+      const stillToCome = batch.pendingEntries().map((entry) => entry.relativePath);
+      assert.deepStrictEqual(
+        stillToCome,
+        set.changes.slice(4).map((change) => change.relativePath),
+        'rejecting one file must not discard the files still to come'
+      );
+
+      // And they can still be written, which is the promise that was broken.
+      for (const entry of set.changes.slice(4)) {
+        await writeOneFromBatch(batch, entry, guard);
+      }
+
+      assert.strictEqual(
+        fs.readdirSync(batchDir).filter((name) => name.endsWith('.ts')).length,
+        6,
+        'six files should be on disk: the seven proposed, less the one rejected'
+      );
+
+      const view = batch.view();
+      assert.strictEqual(view.total, 7, 'the batch should still account for all seven files');
+      assert.strictEqual(
+        view.files.filter((file) => file.status === 'rejected').length,
+        1,
+        'exactly one file should be recorded as rejected'
+      );
+      assert.strictEqual(
+        view.files.filter((file) => file.status === 'completed').length,
+        6,
+        'the other six should be written and awaiting their own reviews'
+      );
+
+      await closeBatchEditors();
+      fs.rmSync(batchDir, { recursive: true, force: true });
+    },
+  },
+
+  {
+    name: 'two review sessions cannot write the same path at once',
+    async run() {
+      const root = requireWorkspaceRoot();
+      const guard = new PathGuard(root, { allowSensitiveFiles: false });
+      const batchDir = path.join(root, BATCH_DIR);
+
+      await closeBatchEditors();
+      fs.rmSync(batchDir, { recursive: true, force: true });
+
+      const set = new ProposalValidator(guard).validateChangeSet(batchMessage());
+      const batch = BatchQueue.create(set);
+      batch.authorizeRemaining();
+
+      const [first, second] = set.changes;
+
+      // "Revise index.ts while reviewing create.ts" is legitimate: the lock is
+      // per path, so a second session on a different file proceeds.
+      assert.ok(batch.claimWrite(first!.relativePath), 'the first session should take the lock');
+      assert.ok(
+        batch.claimWrite(second!.relativePath),
+        'a session on a different file should not be blocked by the first'
+      );
+
+      // A revision of a file already being written must not start: two writers
+      // interleaving into one document is how a file ends up scrambled.
+      assert.strictEqual(
+        batch.claimWrite(first!.relativePath),
+        false,
+        'a second writer for a path already being written must be refused'
+      );
+      assert.strictEqual(batch.isWriting(first!.relativePath), true, 'the lock should be held');
+
+      // Releasing one path frees that path, and only that path.
+      batch.releaseWrite(first!.relativePath);
+      assert.strictEqual(batch.isWriting(first!.relativePath), false, 'the lock should be released');
+      assert.strictEqual(
+        batch.isWriting(second!.relativePath),
+        true,
+        'releasing one path must not release another'
+      );
+      assert.ok(batch.claimWrite(first!.relativePath), 'the freed path should be claimable again');
+
+      batch.releaseWrite(first!.relativePath);
+      batch.releaseWrite(second!.relativePath);
+
+      // Nothing was written by this case: it is about exclusion, not content.
+      assert.ok(!fs.existsSync(batchDir), 'the locking case should not have written any files');
     },
   },
 

@@ -2,7 +2,7 @@
   "name": "pairpilot",
   "displayName": "PairPilot",
   "description": "Human-controlled AI pair programming. The AI proposes, you review and approve, then PairPilot writes the code in your real editor.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "mtafakori1993",
   "license": "MIT",
   "icon": "media/icon.png",

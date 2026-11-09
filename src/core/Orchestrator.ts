@@ -58,6 +58,7 @@ import {
 import { interpretTurn, renderMessage } from '../proposals/TurnInterpreter';
 import { ProposalValidator, toValidatedProposal } from '../proposals/ProposalValidator';
 import { ApprovalManager, toProposalRecord } from '../proposals/ApprovalManager';
+import { BatchQueue, type BatchFileEntry } from '../proposals/BatchQueue';
 import { LiveWriter } from '../editor/LiveWriter';
 import type { DiffManager } from '../editor/DiffManager';
 import type { WorkspaceContext, ContextBudget } from '../context/WorkspaceContext';
@@ -80,8 +81,10 @@ import {
   PairPilotState,
   type AdvisorRecommendation,
   type AITurnHandle,
+  type BatchViewSnapshot,
   type ChatMessage,
   type ContextFileSummary,
+  type DecisionBindingFields,
   type Logger,
   type ProposalRecord,
   type TokenUsage,
@@ -90,6 +93,9 @@ import {
   type ValidatedChangeSet,
   type ValidatedProposal,
 } from '../types';
+
+/** The identity half of a decision, as it arrives from the panel. */
+type DecisionBindingInput = DecisionBindingFields | undefined;
 
 export interface OrchestratorDeps {
   context: vscode.ExtensionContext;
@@ -182,6 +188,40 @@ export class Orchestrator {
   private approvedWholeSet = false;
   /** Files written by the set in progress, so a failure can undo all of them. */
   private appliedThisSet: { relativePath: string; operation: 'create' | 'update' }[] = [];
+
+  /**
+   * The durable record of the batch in flight.
+   *
+   * `changeQueue` remains the ordered list of content the writer consumes, but
+   * it is no longer the *record* of what the developer authorised: that is this.
+   * The distinction matters because the queue's lifetime is "until the next
+   * thing happens", while a batch's must be "until every file has been dealt
+   * with" — a revision to one file must not erase the promise made about the
+   * other six.
+   */
+  private batch: BatchQueue | null = null;
+
+  /**
+   * The file a revision turn is being run for, if any.
+   *
+   * It is what tells `stageProposal` that the proposal about to arrive is a
+   * *revision of one file* rather than a fresh set of files. Without it the only
+   * thing the staging code can do is treat the reply as a new proposal — which
+   * is how revising one file used to discard the rest of the batch.
+   */
+  private revisingPath: string | null = null;
+
+  /**
+   * The file currently being streamed into the editor, if any.
+   *
+   * Held so that "stop, I want this different" can be answered *during* a write:
+   * the partial content has to be taken back off disk, and the proposal it came
+   * from is the one the revision is about.
+   */
+  private writingProposal: ValidatedProposal | null = null;
+
+  /** True while the developer has paused the stream into the editor. */
+  private writePaused = false;
 
   /* --- which kind of work this session is doing -------------------------- */
 
@@ -277,6 +317,53 @@ export class Orchestrator {
       index: this.changeCursor + 1,
       total: this.changeQueue.length,
       setId: this.changeSet?.changeSetHash ?? '',
+    };
+  }
+
+  /**
+   * The batch in flight, as the panel sees it.
+   *
+   * Read straight from the host's own record, so a panel that reloads — or one
+   * that never received an earlier write — renders the same picture rather than
+   * an empty one. Nothing here is derived from the Webview.
+   */
+  get batchView(): BatchViewSnapshot | null {
+    return this.batch ? this.batch.view() : null;
+  }
+
+  /** True while the developer has held the stream into the editor. */
+  get writePausedValue(): boolean {
+    return this.writePaused;
+  }
+
+  /** The file currently being streamed into the editor, or null. */
+  get writingFileValue(): string | null {
+    return this.writingProposal?.relativePath ?? null;
+  }
+
+  /**
+   * The identity the panel should echo back with its next decision.
+   *
+   * Derived from the file currently under the gate or the review, paired with
+   * the batch's current version, so a decision made against a superseded version
+   * is refused rather than applied.
+   */
+  get reviewBindingValue(): { proposalId: string; proposalVersion: number; fileId: string } | null {
+    if (!this.batch) {
+      return null;
+    }
+    const path = this.approvals.getPending()?.relativePath ?? this.pendingFilePath;
+    if (!path) {
+      return null;
+    }
+    const entry = this.batch.byRelativePath(path);
+    if (!entry) {
+      return null;
+    }
+    return {
+      proposalId: this.batch.proposalId,
+      proposalVersion: this.batch.proposalVersion,
+      fileId: entry.fileId,
     };
   }
 
@@ -722,11 +809,48 @@ export class Orchestrator {
       this.deps.logger.info(`Protocol: ${note}`);
     }
 
+    // A revision of a file inside a proposal that is still in flight is merged
+    // into the batch, not staged as a new proposal.
+    //
+    // The batch is the developer's decision about a set of files, and revising
+    // one of them does not unmake that decision. Rebuilding the batch from the
+    // reply is what used to discard the other files: seven approved, one
+    // revised, six gone. So the reply is merged — the file it regenerated
+    // replaces its own entry, anything new is added, and every file it did not
+    // mention is left exactly as it was, still written or still waiting to be.
+    const revising = this.revisingPath;
+    if (this.batch && revising && this.batch.byRelativePath(revising)) {
+      const batch = this.batch;
+      const merged = batch.mergeRevision(set, revising);
+      this.revisingPath = null;
+      this.deps.logger.info(
+        `Revision merged into ${batch.batchId}: ${merged.revised.length} file(s) replaced, ` +
+          `${merged.added.length} added, now at version ${merged.version}.`
+      );
+
+      // The transcript keeps the revised explanation, so the developer can read
+      // what changed and why alongside the code in the editor.
+      this.appendAssistant(sessionId, renderMessage(message), undefined);
+
+      // Point the cursor at what the batch says is next, so the file gate asks
+      // about the revised file rather than about whichever file the old cursor
+      // happened to be on.
+      this.syncCursorToBatch();
+      this.enterFileApproval();
+      return { ok: true };
+    }
+
     this.changeSet = set;
     this.changeQueue = set.changes;
     this.changeCursor = 0;
     this.approvedWholeSet = false;
     this.appliedThisSet = [];
+
+    // The batch record starts here, at version 1, and outlives any single
+    // file's write. It is created from the *validated* set, so every entry
+    // already carries content the validator has accepted as non-empty — the
+    // batch can only ever hold files that are safe to write.
+    this.batch = BatchQueue.create(set);
 
     // The proposal itself becomes the assistant's turn in the transcript, so the
     // developer can read the explanation alongside the changes it describes.
@@ -734,6 +858,30 @@ export class Orchestrator {
 
     this.enterFileApproval();
     return { ok: true };
+  }
+
+  /**
+   * Rebuild the file-approval queue from the batch, and aim it at what is next.
+   *
+   * The queue and the batch describe the same files from two directions: the
+   * batch is the durable record, the queue is the ordered list the approval gate
+   * reads. A revision rewrites the batch without rewriting the queue, so after a
+   * merge the two would disagree — the gate would ask about a file that is no
+   * longer pending, or skip one that still is. Rebuilding the queue from the
+   * batch keeps them one thing described twice rather than two things that have
+   * to be kept in step by hand.
+   */
+  private syncCursorToBatch(): void {
+    if (!this.batch) {
+      return;
+    }
+    const ordered = this.batch.all().map((entry) => entry.change);
+    this.changeQueue = ordered;
+    const next = this.batch.pendingEntries()[0] ?? this.batch.nextAwaitingReview();
+    const index = next
+      ? ordered.findIndex((change) => change.relativePath === next.relativePath)
+      : -1;
+    this.changeCursor = index >= 0 ? index : ordered.length;
   }
 
   /** Assemble context and ask the AI for a next-step recommendation. */
@@ -983,8 +1131,13 @@ export class Orchestrator {
    * Accepts either the current change's own hash — "this file" — or the hash of
    * the whole set — "this file and every remaining one". Both are verified
    * against live state, so a stale UI can authorise neither.
+   *
+   * A batch authorisation is *permission to write*, nothing more. It is recorded
+   * on the batch as `authorized` for every remaining file; each of those files
+   * still gets its own review afterwards, which is a separate decision the
+   * developer has not made yet.
    */
-  async approveFileCreation(contentHash: string): Promise<void> {
+  async approveFileCreation(contentHash: string, binding?: DecisionBindingInput): Promise<void> {
     if (!this.machine.is(PairPilotState.WAITING_FILE_APPROVAL)) {
       this.error = 'There is no pending file request to approve.';
       this.deps.notify();
@@ -996,6 +1149,17 @@ export class Orchestrator {
       this.changeSet !== null &&
       this.changeSet.changeSetHash === contentHash &&
       this.changeQueue.length > 1;
+
+    // A decision that names a proposal version must name the current one. This
+    // runs before the hash check so that a panel showing a superseded version is
+    // told *that*, rather than being left to guess from a hash mismatch.
+    try {
+      this.batch?.assertFresh(binding, change?.relativePath);
+    } catch (error) {
+      this.error = describeError(error);
+      this.deps.notify();
+      return;
+    }
 
     let proposal: ValidatedProposal;
     try {
@@ -1010,6 +1174,10 @@ export class Orchestrator {
     const turnId = this.activeTurnId;
 
     if (isWholeSet && this.changeQueue.length > 1) {
+      // Record the authorisation against every remaining file before writing the
+      // first one, so the batch can report what was promised even if the first
+      // write fails.
+      this.batch?.authorizeRemaining();
       this.notice = `You approved writing all ${this.changeQueue.length} files. Each file is still shown for review as it is written.`;
     }
 
@@ -1025,7 +1193,32 @@ export class Orchestrator {
   private async applyChange(proposal: ValidatedProposal, turnId: number): Promise<void> {
     const config = this.deps.readConfig();
 
+    // Every precondition is checked *before* the editor is touched, so a file
+    // can never be created empty and then left that way because the content
+    // turned out to be missing further down. The failure names the stage.
+    const preflight = this.preflightWrite(proposal);
+    if (!preflight.ok) {
+      this.recordBatchFailure(proposal.relativePath, preflight.reason);
+      this.error = preflight.reason;
+      this.deps.logger.warn(`Refused to write ${proposal.relativePath}: ${preflight.reason}`);
+      // The batch keeps its other files; only this one is marked failed.
+      await this.advanceAfterFile(proposal.relativePath, turnId, { failed: true });
+      return;
+    }
+
+    // One writer per path. Two review sessions — an original and a revision —
+    // must never stream into the same file at once, because their edits would
+    // interleave into corrupt output.
+    if (this.batch && !this.batch.claimWrite(proposal.relativePath)) {
+      const reason = `"${proposal.relativePath}" is already being written by another review session, so this write waited rather than interleaving with it.`;
+      this.error = reason;
+      this.deps.logger.warn(reason);
+      this.deps.notify();
+      return;
+    }
+
     try {
+      this.batch?.markWriting(proposal.relativePath);
       this.machine.transition(PairPilotState.CREATING_FILE, 'permission granted');
       this.currentStep = `Preparing ${proposal.relativePath}`;
       this.deps.notify();
@@ -1048,6 +1241,12 @@ export class Orchestrator {
         },
       });
       this.writer = writer;
+      // Remember which proposal is being streamed, so "stop, I want this
+      // different" can be answered while the file is still being written: the
+      // partial content is on disk and has to be taken back, and the revision is
+      // about this proposal.
+      this.writingProposal = proposal;
+      this.writePaused = false;
 
       // A sensitive target needs a separate, explicit confirmation.
       const assessment = this.deps.workspace.pathGuard.assess(proposal.relativePath);
@@ -1113,10 +1312,18 @@ export class Orchestrator {
         relativePath: proposal.relativePath,
         operation: proposal.proposal.operation,
       });
+      this.batch?.markCompleted(proposal.relativePath);
       this.activeProposal = toProposalRecord(proposal);
       this.deps.store.addProposal(this.deps.store.getOrCreateActive().id, this.activeProposal);
       this.pendingFilePath = null;
       this.pendingFileOperation = null;
+
+      // The write lock is released here, not when the review finishes: the file
+      // is on disk and stable, and holding the lock through a review the
+      // developer might leave open for an hour would block a revision to it.
+      this.batch?.releaseWrite(proposal.relativePath);
+      this.writingProposal = null;
+      this.writePaused = false;
 
       this.machine.transition(PairPilotState.REVIEWING, 'write complete');
       this.currentStep = `Reviewing ${proposal.relativePath}${this.positionSuffix()}`;
@@ -1129,12 +1336,83 @@ export class Orchestrator {
       // Webview (spec section 8).
       await this.revealInEditor(proposal.absolutePath);
     } catch (error) {
+      this.batch?.releaseWrite(proposal.relativePath);
+      this.writingProposal = null;
+      this.writePaused = false;
       if (this.writer) {
         await this.writer.rollback('failed');
         this.writer = null;
       }
       this.handleTurnFailure(error, turnId);
     }
+  }
+
+  /**
+   * Every check that must pass before a write may begin.
+   *
+   * Spec section 4 lists these as preconditions for writing; they are gathered
+   * here rather than scattered through the write so that the answer to "why was
+   * this file not written?" is one function. A failure names the file and the
+   * stage, because "something went wrong" is not actionable. Nothing here ever
+   * substitutes placeholder content for content that is missing.
+   */
+  private preflightWrite(proposal: ValidatedProposal): { ok: true } | { ok: false; reason: string } {
+    const entry = this.batch?.byRelativePath(proposal.relativePath);
+
+    // 1. The proposal must still exist in our own record.
+    if (this.batch && !entry) {
+      return {
+        ok: false,
+        reason: `"${proposal.relativePath}" is no longer part of the proposal in progress, so it was not written.`,
+      };
+    }
+
+    // 2. Content must be present and non-empty. The validator already refuses an
+    // empty change, so reaching this means something upstream lost the bytes —
+    // which is exactly the condition that must fail loudly rather than create an
+    // empty file.
+    if (typeof proposal.assembledCode !== 'string' || proposal.assembledCode.trim().length === 0) {
+      return {
+        ok: false,
+        reason: `The proposed content for "${proposal.relativePath}" is missing or empty, so no file was created. This is a defect in how the proposal was carried, not something you did.`,
+      };
+    }
+
+    // 3. The path must still resolve inside the workspace. A symlink could have
+    // appeared since validation, so this is re-asserted at write time.
+    try {
+      this.deps.workspace.pathGuard.assertRealPathInsideWorkspace(proposal.relativePath);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `"${proposal.relativePath}" no longer resolves inside the workspace, so it was not written: ${describeError(error)}`,
+      };
+    }
+
+    // 4. The content hash must match the approval binding, when the batch holds
+    // one. A mismatch means the content moved after the developer approved it.
+    if (entry && entry.contentHash !== proposal.contentHash) {
+      return {
+        ok: false,
+        reason: `The content for "${proposal.relativePath}" changed after you approved it, so the write was refused. Review the current version.`,
+      };
+    }
+
+    // 5. A required approval must exist and still be current.
+    if (this.approvals.getPending() === null && this.approvedWholeSet === false && !this.batch) {
+      return {
+        ok: false,
+        reason: `There is no approval covering "${proposal.relativePath}", so it was not written.`,
+      };
+    }
+
+    return { ok: true };
+  }
+
+  /** Note a file's failure on the batch without disturbing its siblings. */
+  private recordBatchFailure(relativePath: string, reason: string): void {
+    this.batch?.markFailed(relativePath, reason);
+    this.batch?.releaseWrite(relativePath);
   }
 
   /**
@@ -1153,21 +1431,35 @@ export class Orchestrator {
       return;
     }
     const streamed = this.streamingCodeFor(proposal.relativePath);
-    if (streamed.length === 0) {
-      writer.push(proposal.assembledCode);
-      return;
-    }
-    if (streamed.length <= proposal.assembledCode.length) {
-      writer.push(streamed);
-      if (streamed.length < proposal.assembledCode.length) {
-        // The scan was truncated or ended early; the reviewed content is the
-        // authority, so the remainder comes from there.
-        writer.push(proposal.assembledCode.slice(streamed.length));
+
+    // The reviewed content is the authority for *what* the file should contain.
+    // The live scan exists only so the developer can watch the characters
+    // arrive; it is never allowed to decide the bytes.
+    //
+    // An earlier version compared lengths and pushed the streamed text whenever
+    // it was no longer than the reviewed content. Equal length does not mean
+    // equal text: a scanner that captured a sibling's content of the same length
+    // would have had its bytes written. The check is now on the bytes
+    // themselves, and anything that is not a prefix of the reviewed content is
+    // discarded in favour of it.
+    if (streamed.length > 0 && streamed.length <= proposal.assembledCode.length) {
+      const prefix = proposal.assembledCode.slice(0, streamed.length);
+      if (streamed === prefix) {
+        writer.push(streamed);
+        if (streamed.length < proposal.assembledCode.length) {
+          // The scan ended early; the reviewed content supplies the remainder.
+          writer.push(proposal.assembledCode.slice(streamed.length));
+        }
+        return;
       }
-      return;
+      // Not a prefix: the scan captured something else. Say so, because a
+      // scanner that mis-attributes content is a bug worth seeing in the log
+      // rather than a silent fallback.
+      this.deps.logger.warn(
+        `Live stream content for ${proposal.relativePath} did not match the reviewed content; writing the reviewed content instead.`
+      );
     }
-    // The scan produced more than this file holds (it captured a longer sibling),
-    // so the reviewed content is the only safe source.
+
     writer.push(proposal.assembledCode);
   }
 
@@ -1188,7 +1480,7 @@ export class Orchestrator {
   }
 
   /** The developer declined the file creation/update. Nothing was written. */
-  rejectFileCreation(contentHash: string): void {
+  rejectFileCreation(contentHash: string, binding?: DecisionBindingInput): void {
     if (!this.machine.is(PairPilotState.WAITING_FILE_APPROVAL)) {
       this.error = 'There is no pending file request to reject.';
       this.deps.notify();
@@ -1196,6 +1488,7 @@ export class Orchestrator {
     }
     let proposal: ValidatedProposal;
     try {
+      this.batch?.assertFresh(binding, this.approvals.getPending()?.relativePath);
       proposal = this.approvals.verify(contentHash) ?? this.requirePending();
     } catch (error) {
       this.error = describeError(error);
@@ -1217,7 +1510,7 @@ export class Orchestrator {
   }
 
   /** The developer approved the written code. */
-  async approveCode(contentHash: string): Promise<void> {
+  async approveCode(contentHash: string, binding?: DecisionBindingInput): Promise<void> {
     if (!this.machine.is(PairPilotState.WAITING_CODE_APPROVAL, PairPilotState.REVIEWING)) {
       this.error = 'There is nothing awaiting approval.';
       this.deps.notify();
@@ -1225,6 +1518,7 @@ export class Orchestrator {
     }
     let proposal: ValidatedProposal;
     try {
+      this.batch?.assertFresh(binding, this.approvals.getPending()?.relativePath);
       proposal = this.approvals.verify(contentHash);
     } catch (error) {
       this.error = describeError(error);
@@ -1240,33 +1534,162 @@ export class Orchestrator {
     this.machine.transition(PairPilotState.APPROVED, 'code approved');
     this.currentStep = null;
     this.notice = `${proposal.relativePath} is approved and kept.`;
+    this.batch?.markApproved(proposal.relativePath);
     this.deps.notify();
 
-    // --- more changes in this set? -----------------------------------------
-    if (this.changeCursor < this.changeQueue.length - 1) {
-      this.changeCursor += 1;
-      if (this.approvedWholeSet) {
-        // The developer already granted permission for the remaining files, so
-        // the file gate is satisfied; the write proceeds straight away. The
-        // *review* gate is not skipped — every written file is still shown.
-        const next = this.currentChange();
-        if (!next) {
-          this.finishChangeSet();
-          return;
-        }
-        this.approvals.setPending(toValidatedProposal(next, this.changeSet?.envelope));
-        this.machine.transition(PairPilotState.WAITING_FILE_APPROVAL, 'pre-approved by the set');
-        await this.applyChange(
-          toValidatedProposal(next, this.changeSet?.envelope),
-          this.activeTurnId
-        );
+    await this.advanceAfterFile(proposal.relativePath, this.activeTurnId, {});
+  }
+
+  /**
+   * Hand the turn on to the next file of the batch, or settle it if this was the
+   * last one.
+   *
+   * This is the single place the batch advances, and it is deliberately driven
+   * by the *batch's* own record rather than by a cursor into the queue. Every
+   * sibling file stays exactly where it was: approving, failing or revising one
+   * file moves only that file's entry, so the seven files of a proposal remain
+   * seven independent reviews rather than one that collapses when the first
+   * decision is made.
+   *
+   * @param options.failed Set when the file just processed could not be written.
+   *   A failed file does not stop the batch — spec section 6 — it just does not
+   *   become the file under review.
+   */
+  private async advanceAfterFile(
+    relativePath: string,
+    turnId: number,
+    options: { failed?: boolean }
+  ): Promise<void> {
+    const batch = this.batch;
+    const failed = options.failed === true;
+
+    if (failed) {
+      // The file is already marked failed on the batch by `recordBatchFailure`.
+      // Say which file and that the rest are unaffected, because "3 of 7 were
+      // written" is the fact the developer needs, not silence.
+      const remaining = batch
+        ? batch.all().filter((entry) => entry.status === 'pending' || entry.status === 'authorized')
+            .length
+        : 0;
+      this.deps.logger.warn(
+        `Batch ${batch?.batchId ?? '(none)'}: ${relativePath} failed; ${remaining} file(s) still to write.`
+      );
+    }
+
+    // No batch (a single-file proposal, or one already settled): behave exactly
+    // as the pre-batch code did.
+    if (!batch) {
+      if (this.changeCursor < this.changeQueue.length - 1) {
+        this.changeCursor += 1;
+        this.enterFileApproval();
         return;
       }
-      this.enterFileApproval();
+      await this.afterSetApproved(this.requireReviewed(relativePath));
       return;
     }
 
-    await this.afterSetApproved(proposal);
+    // Any file still awaiting a decision keeps the developer where they are;
+    // the panel decides which review session to show.
+    const awaiting = batch.nextAwaitingReview();
+    if (awaiting && awaiting.relativePath !== relativePath) {
+      this.deps.logger.info(
+        `Batch ${batch.batchId}: ${awaiting.relativePath} is awaiting review; ${relativePath} stays in its own session.`
+      );
+    }
+
+    // Move the cursor so the queue's notion of "current" matches the batch, for
+    // the single-file code paths and the status line that still read it.
+    const nextIndex = this.changeQueue.findIndex(
+      (change) => change.relativePath === (batch.nextPending()?.relativePath ?? '')
+    );
+    if (nextIndex >= 0) {
+      this.changeCursor = nextIndex;
+    }
+
+    const next = batch.nextPending();
+
+    // Nothing left to write. If something is still under review, the turn has
+    // not finished — the developer is mid-review and the batch stays open.
+    if (!next) {
+      if (batch.nextAwaitingReview()) {
+        this.currentStep = null;
+        this.deps.notify();
+        return;
+      }
+      this.reportBatchOutcome();
+      await this.afterSetApproved(this.requireReviewed(relativePath));
+      return;
+    }
+
+    const nextProposal = this.proposalForEntry(next);
+
+    if (this.approvedWholeSet || next.status === 'authorized') {
+      // Permission for the remaining files is already held, so the path gate is
+      // satisfied and the write proceeds. The *review* gate is not skipped:
+      // every written file is still shown afterwards.
+      this.approvals.setPending(nextProposal);
+      this.machine.transition(PairPilotState.WAITING_FILE_APPROVAL, 'pre-approved by the set');
+      this.deps.notify();
+      await this.applyChange(nextProposal, turnId);
+      return;
+    }
+
+    // Not authorised: ask about this file, exactly as the first one was asked
+    // about. The batch remains open behind the gate.
+    this.approvals.setPending(nextProposal);
+    this.enterFileApproval();
+  }
+
+  /**
+   * Summarise what the batch actually did, once none of it is left to do.
+   *
+   * A batch that wrote six of seven files must not report as a plain success.
+   * The counts come from the batch's own record, so this is the real filesystem
+   * outcome rather than a restatement of what was intended.
+   */
+  private reportBatchOutcome(): void {
+    const batch = this.batch;
+    if (!batch) {
+      return;
+    }
+    const counts = batch.counts();
+    if (counts.failed === 0) {
+      return;
+    }
+    const failedFiles = batch
+      .all()
+      .filter((entry) => entry.status === 'failed')
+      .map((entry) => entry.relativePath);
+    this.notice = `${counts.completed} of ${counts.total} files were written. These could not be written: ${failedFiles.join(', ')}. The rest of the proposal is unaffected.`;
+  }
+
+  /** Reconstruct the per-file proposal for a batch entry. */
+  private proposalForEntry(entry: BatchFileEntry): ValidatedProposal {
+    return toValidatedProposal(entry.change, this.changeSet?.envelope);
+  }
+
+  /**
+   * The validated proposal for a path that has just been reviewed.
+   *
+   * Falls back to the batch entry, then to the pending approval, so a caller
+   * that has already consumed the pending decision still gets the file it means
+   * rather than a null that would settle the turn early.
+   */
+  private requireReviewed(relativePath: string): ValidatedProposal {
+    const entry = this.batch?.byRelativePath(relativePath);
+    if (entry) {
+      return this.proposalForEntry(entry);
+    }
+    const pending = this.approvals.getPending();
+    if (pending && pending.relativePath === relativePath) {
+      return pending;
+    }
+    const change = this.changeQueue.find((item) => item.relativePath === relativePath);
+    if (change) {
+      return toValidatedProposal(change, this.changeSet?.envelope);
+    }
+    // Should be unreachable; throwing beats settling a turn against the wrong file.
+    throw new Error(`No validated proposal is held for "${relativePath}".`);
   }
 
   /**
@@ -1304,7 +1727,7 @@ export class Orchestrator {
   }
 
   /** The developer rejected the written code. The file is rolled back. */
-  async rejectCode(contentHash: string): Promise<void> {
+  async rejectCode(contentHash: string, binding?: DecisionBindingInput): Promise<void> {
     if (!this.machine.is(PairPilotState.WAITING_CODE_APPROVAL, PairPilotState.REVIEWING)) {
       this.error = 'There is nothing awaiting rejection.';
       this.deps.notify();
@@ -1312,6 +1735,7 @@ export class Orchestrator {
     }
     let proposal: ValidatedProposal;
     try {
+      this.batch?.assertFresh(binding, this.approvals.getPending()?.relativePath);
       proposal = this.approvals.verify(contentHash);
     } catch (error) {
       this.error = describeError(error);
@@ -1319,7 +1743,6 @@ export class Orchestrator {
       return;
     }
 
-    const remaining = this.changeQueue.length - this.changeCursor - 1;
     this.approvals.record('reject', proposal);
     this.machine.transition(PairPilotState.REJECTED, 'code rejected');
 
@@ -1328,21 +1751,43 @@ export class Orchestrator {
     this.activeProposal = null;
     this.recommendation = null;
     this.streamingCode = [];
-    this.discardRemainingChanges();
-    this.machine.tryTransition(PairPilotState.IDLE, 'turn finished');
+    this.batch?.markRejected(proposal.relativePath);
 
     const base = rollback.restored
       ? `Rejected. ${proposal.relativePath} was restored to its previous content.`
       : `Rejected. ${proposal.relativePath} was removed, because PairPilot created it.`;
+
+    // Rejecting one file is a decision about that file. The rest of the batch is
+    // untouched and still listed, so the developer can carry on with the files
+    // they have not yet judged. Only when there is nothing left does the turn end.
+    const stillToCome = this.batch
+      ? this.batch.all().filter((entry) => entry.status === 'pending' || entry.status === 'authorized').length
+      : this.changeQueue.length - this.changeCursor - 1;
+
+    if (this.batch && stillToCome > 0) {
+      this.notice = `${base} The other ${stillToCome} file${stillToCome === 1 ? '' : 's'} in this proposal are still waiting.`;
+      this.currentStep = null;
+      this.machine.tryTransition(PairPilotState.IDLE, 'ready for the next file');
+      this.deps.notify();
+      await this.advanceAfterFile(proposal.relativePath, this.activeTurnId, {});
+      return;
+    }
+
+    this.machine.tryTransition(PairPilotState.IDLE, 'turn finished');
     this.notice =
-      remaining > 0
-        ? `${base} The ${remaining} remaining file${remaining === 1 ? '' : 's'} in this proposal were not written.`
+      stillToCome > 0
+        ? `${base} The ${stillToCome} remaining file${stillToCome === 1 ? '' : 's'} in this proposal were not written.`
         : base;
     this.deps.notify();
+    this.discardRemainingChanges();
   }
 
   /** The developer asked for a revised proposal. */
-  async requestChanges(contentHash: string, feedback: string): Promise<void> {
+  async requestChanges(
+    contentHash: string,
+    feedback: string,
+    binding?: DecisionBindingInput
+  ): Promise<void> {
     if (!this.machine.is(PairPilotState.WAITING_CODE_APPROVAL, PairPilotState.REVIEWING)) {
       this.error = 'There is nothing to revise.';
       this.deps.notify();
@@ -1350,6 +1795,7 @@ export class Orchestrator {
     }
     let proposal: ValidatedProposal;
     try {
+      this.batch?.assertFresh(binding, this.approvals.getPending()?.relativePath);
       proposal = this.approvals.verify(contentHash);
     } catch (error) {
       this.error = describeError(error);
@@ -1364,7 +1810,16 @@ export class Orchestrator {
     // unapproved content while the AI thinks.
     await this.rollbackWrittenFile(proposal, 'cancelled');
     this.activeProposal = null;
-    this.discardRemainingChanges();
+
+    // A revision is scoped to the file it was asked about. The batch keeps every
+    // sibling exactly as it is, which is what lets the developer revise
+    // `index.php` while `create.php` still sits written and unreviewed.
+    this.batch?.markRevision(proposal.relativePath);
+
+    // Tells `stageProposal` that the reply about to arrive revises one file of
+    // the batch in flight, so it is merged into that batch instead of replacing
+    // it.
+    this.revisingPath = proposal.relativePath;
 
     const turnId = ++this.activeTurnId;
     this.deps.notify();
@@ -1530,6 +1985,103 @@ export class Orchestrator {
     this.deps.notify();
   }
 
+  /* ---------------------------------------------------------------------- */
+  /* Interrupting a write                                                   */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Hold the stream where it is, so the developer can read what has arrived.
+   *
+   * The characters keep coming from the model — they are not ours to stop — but
+   * nothing further is put into the editor until resume. The alternative, a
+   * write that cannot be paused, forces the developer to choose between watching
+   * a file they have already decided is wrong and cancelling work that may be
+   * nearly right.
+   *
+   * The document already written is left exactly as it is: pausing is not an
+   * undo, and the developer asked to look, not to undo.
+   */
+  pauseWrite(): void {
+    if (!this.writer || !this.writer.isWriting) {
+      return;
+    }
+    if (this.writePaused) {
+      return;
+    }
+    this.writer.pause();
+    this.writePaused = true;
+    this.notice = 'Paused. The rest of the file will be written when you resume.';
+    this.deps.notify();
+  }
+
+  /** Carry on writing from where the pause left off. */
+  resumeWrite(): void {
+    if (!this.writer || !this.writePaused) {
+      return;
+    }
+    this.writer.resume();
+    this.writePaused = false;
+    this.notice = 'Resumed.';
+    this.deps.notify();
+  }
+
+  /**
+   * "Not like that" — asked while the file is still being written.
+   *
+   * This is the mid-stream counterpart of `requestChanges`. It stops the turn,
+   * takes the partial content back off disk, and sends the developer's feedback
+   * for a revision of *this* file. The batch is deliberately left standing: the
+   * other files in the proposal are none of this file's business, and a
+   * developer who interrupts one of seven must still find the other six where
+   * they left them.
+   */
+  async requestChangesWhileWriting(feedback: string): Promise<void> {
+    const proposal = this.writingProposal;
+    const writing = this.machine.is(PairPilotState.CREATING_FILE, PairPilotState.WRITING_CODE);
+
+    if (!proposal || !writing) {
+      this.error = 'No file is being written, so there is nothing to change yet.';
+      this.deps.notify();
+      return;
+    }
+
+    // Stop the turn first. Anything the runtime sends from here on belongs to a
+    // turn nobody is listening to, and `activeTurnId` is what makes that true.
+    this.activeTurnId += 1;
+    this.session?.cancel();
+    this.session = null;
+
+    // Take the partial file back off disk before asking for a revision: the
+    // developer has said the content is wrong, so leaving half of it in the
+    // workspace while the AI thinks would be leaving unapproved code behind.
+    const writer = this.writer;
+    this.writer = null;
+    this.writingProposal = null;
+    this.writePaused = false;
+    if (writer) {
+      await writer.rollback('cancelled');
+    }
+    this.approvals.clearPending();
+    this.pendingFilePath = null;
+    this.pendingFileOperation = null;
+
+    this.approvals.record('request_changes', proposal, { feedback });
+    this.batch?.markRevision(proposal.relativePath);
+    this.revisingPath = proposal.relativePath;
+
+    if (this.machine.canTransition(PairPilotState.CANCELLED)) {
+      this.machine.transition(PairPilotState.CANCELLED, 'changes requested during the write');
+    }
+
+    const turnId = this.activeTurnId;
+    this.deps.notify();
+    try {
+      await this.retryWithFeedback(proposal, feedback, turnId);
+    } catch (error) {
+      this.handleTurnFailure(error, turnId);
+    }
+  }
+
   /** Explicitly discard an unapproved write that is still on disk. */
   async revertLastWrite(): Promise<void> {
     const pending = this.approvals.getPending();
@@ -1587,6 +2139,16 @@ export class Orchestrator {
     this.changeCursor = 0;
     this.approvedWholeSet = false;
     this.appliedThisSet = [];
+    // The batch record goes with it. Leaving it behind would let `batchView`
+    // keep reporting a batch whose files no longer exist anywhere, and a later
+    // decision could be checked for freshness against content that is gone.
+    this.batch = null;
+    // A revision and a write belong to the batch they were about. Once the batch
+    // is gone neither can be resumed, and leaving `revisingPath` set would make
+    // the *next* proposal look like a revision of a batch that no longer exists.
+    this.revisingPath = null;
+    this.writingProposal = null;
+    this.writePaused = false;
   }
 
   private resetChangeSet(): void {
@@ -1596,6 +2158,7 @@ export class Orchestrator {
 
   /** Clear everything a finished turn leaves behind. */
   private resetTurnState(): void {
+    this.roadmapGenerated = false;
     this.approvals.reset();
     this.pinnedContext.clear();
     this.lastContextFiles = [];

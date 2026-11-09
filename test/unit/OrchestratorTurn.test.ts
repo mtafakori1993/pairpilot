@@ -742,3 +742,204 @@ describe('guards that do not rely on the model behaving', () => {
     expect(orchestrator.pinnedContextValue).not.toContain('../outside.ts');
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* The batch, seen from the turn                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * These run the real turn up to the point where a write would begin, and inspect
+ * the batch the host is now keeping.
+ *
+ * The write itself still needs an editor host, so what is asserted here is the
+ * record the write will be driven from: that the batch exists, holds all the
+ * files with their content, is sent to the panel, and — the reported bug — that
+ * the panel's *context* list is a different thing from the batch and is not a
+ * statement about the proposal.
+ */
+describe('the batch behind a multi-file proposal', () => {
+  it('records every file with its content when the proposal is staged', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    const batch = orchestrator.batchView;
+    expect(batch).not.toBeNull();
+    expect(batch!.total).toBe(2);
+    expect(batch!.files.map((file) => file.file)).toEqual([
+      'src/Domain/User.php',
+      'src/Infrastructure/UserRepository.php',
+    ]);
+    // Both start as work still to be done.
+    expect(batch!.files.every((file) => file.status === 'pending')).toBe(true);
+    expect(batch!.pending).toBe(2);
+  });
+
+  it('gives the panel a stable identity to echo back with a decision', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    const binding = orchestrator.reviewBindingValue;
+    expect(binding).not.toBeNull();
+    expect(binding!.proposalId).toMatch(/^[a-f0-9]{64}$/);
+    expect(binding!.proposalVersion).toBe(1);
+    expect(binding!.fileId).toMatch(/^[a-f0-9]{16}$/);
+
+    // The binding names the file the developer is actually being asked about.
+    const batch = orchestrator.batchView!;
+    const first = batch.files.find((file) => file.fileId === binding!.fileId);
+    expect(first!.file).toBe('src/Domain/User.php');
+  });
+
+  it('refuses a decision that claims a superseded proposal version', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    await orchestrator.approveFileCreation(
+      orchestrator.approvals.getPendingHash()!,
+      { proposalVersion: 99 }
+    );
+
+    // Refused, and — the important part — nothing was written or staged off the
+    // back of a decision about content the developer never saw.
+    expect(orchestrator.errorValue).toMatch(/changed after you looked|version/i);
+    expect(fs.existsSync(path.join(root, 'src', 'Domain', 'User.php'))).toBe(false);
+  });
+
+  it('refuses a decision that names a file from a different proposal', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    await orchestrator.approveFileCreation(orchestrator.approvals.getPendingHash()!, {
+      fileId: '0000000000000000',
+    });
+
+    expect(orchestrator.errorValue).toMatch(/not part of the proposal/i);
+    expect(fs.existsSync(path.join(root, 'src', 'Domain', 'User.php'))).toBe(false);
+  });
+
+  it('accepts a decision that claims the version actually on screen', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    const binding = orchestrator.reviewBindingValue!;
+    // The binding is accepted — the write then proceeds to the part this file
+    // cannot fake, which is fine: what is asserted is that the *binding* did not
+    // cause a refusal.
+    await orchestrator.approveFileCreation(orchestrator.approvals.getPendingHash()!, binding);
+
+    expect(orchestrator.errorValue ?? '').not.toMatch(/changed after you looked|not part of/i);
+  });
+
+  it('keeps the context list and the batch as separate things', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    // The reported confusion: an empty *context* list sitting under a proposal.
+    // It is empty because no workspace files were sent, which says nothing about
+    // whether the proposal is intact — and here the batch proves it is.
+    expect(orchestrator.lastContextFilesValue).toEqual([]);
+    expect(orchestrator.batchView!.total).toBe(2);
+  });
+
+  it('scopes a revision to one file without disturbing the batch', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    const batch = orchestrator.batchView!;
+    const before = batch.files.map((file) => ({ file: file.file, fileId: file.fileId }));
+
+    // A revision is asked for while the file gate is open: it is refused,
+    // because there is nothing written to revise yet — and critically the batch
+    // is left completely intact rather than torn down by the refusal.
+    await orchestrator.requestChanges('0'.repeat(64), 'use a different approach');
+
+    const after = orchestrator.batchView!;
+    expect(after.files.map((file) => ({ file: file.file, fileId: file.fileId }))).toEqual(before);
+    expect(after.total).toBe(2);
+    expect(after.proposalVersion).toBe(1);
+  });
+
+  it('forgets the batch when the proposal is declined', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+    expect(orchestrator.batchView).not.toBeNull();
+
+    orchestrator.rejectFileCreation(orchestrator.approvals.getPendingHash()!);
+
+    // Declining the gate abandons the set, so the batch goes with it — otherwise
+    // the panel would keep listing files nobody is going to write.
+    expect(orchestrator.batchView).toBeNull();
+    expect(orchestrator.changeProgressValue).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Interrupting a write                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The mid-stream controls.
+ *
+ * The streaming itself needs a real editor, so it is covered by the VS Code
+ * suite. What is testable here is the other half of the contract: that these
+ * messages are refused when there is no write to interrupt, because a pause that
+ * silently "succeeds" against nothing leaves the panel showing a Pause button
+ * that lies about what the host is doing.
+ */
+describe('holding a write', () => {
+  it('starts with nothing paused and no file being written', async () => {
+    const orchestrator = makeOrchestrator(new ScriptedAI(MULTI_FILE_REPLY));
+    await orchestrator.submitTask('Create a user module');
+
+    // Sitting at the permission gate is not writing: nothing has been opened in
+    // the editor yet, so there is no stream to hold.
+    expect(orchestrator.writePausedValue).toBe(false);
+    expect(orchestrator.writingFileValue).toBeNull();
+  });
+
+  it('does nothing when there is no write to pause', async () => {
+    const orchestrator = makeOrchestrator(new ScriptedAI(MULTI_FILE_REPLY));
+    await orchestrator.submitTask('Create a user module');
+
+    orchestrator.pauseWrite();
+
+    // No writer, so no pause, and — the part that matters — no claim that the
+    // stream is being held.
+    expect(orchestrator.writePausedValue).toBe(false);
+    expect(orchestrator.noticeValue ?? '').not.toMatch(/paused/i);
+  });
+
+  it('does nothing when there is no pause to resume', async () => {
+    const orchestrator = makeOrchestrator(new ScriptedAI(MULTI_FILE_REPLY));
+    await orchestrator.submitTask('Create a user module');
+
+    orchestrator.resumeWrite();
+
+    expect(orchestrator.writePausedValue).toBe(false);
+    expect(orchestrator.errorValue).toBeNull();
+  });
+
+  it('refuses a mid-write revision when no file is being written', async () => {
+    const orchestrator = makeOrchestrator(new ScriptedAI(MULTI_FILE_REPLY));
+    await orchestrator.submitTask('Create a user module');
+
+    await orchestrator.requestChangesWhileWriting('use a different approach');
+
+    // A revision while nothing is streaming has no file to take back off disk,
+    // so it is refused with an explanation rather than silently spending a turn.
+    expect(orchestrator.errorValue).toMatch(/nothing to change/i);
+    // And the batch is untouched: nothing was written, so nothing is under
+    // revision.
+    expect(orchestrator.batchView!.proposalVersion).toBe(1);
+    expect(orchestrator.batchView!.files.every((file) => file.status === 'pending')).toBe(true);
+  });
+});
+

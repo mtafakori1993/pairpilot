@@ -19,7 +19,23 @@ import * as vscode from 'vscode';
 import { MessageValidator } from '../security/MessageValidator';
 import { describeError } from '../core/errors';
 import type { Orchestrator } from '../core/Orchestrator';
-import { PairPilotState, type WebviewRequest } from '../types';
+import { PairPilotState, type DecisionBindingFields, type WebviewRequest } from '../types';
+
+/**
+ * Lift the identity claims off a decision message.
+ *
+ * The fields are passed through as the panel stated them, including when they
+ * are absent: "no claim" and "this exact version" are different statements, and
+ * the Orchestrator is the place that decides what an unclaimed field means. The
+ * router's job is only to stop trusting the channel, not to reinterpret it.
+ */
+function bindingOf(message: DecisionBindingFields): DecisionBindingFields {
+  return {
+    ...(message.proposalId !== undefined ? { proposalId: message.proposalId } : {}),
+    ...(message.proposalVersion !== undefined ? { proposalVersion: message.proposalVersion } : {}),
+    ...(message.fileId !== undefined ? { fileId: message.fileId } : {}),
+  };
+}
 
 export interface RouterDeps {
   orchestrator: Orchestrator;
@@ -79,15 +95,46 @@ export class WebviewMessageRouter {
         await orchestrator.cancel();
         return;
 
+      case 'pauseWrite':
+        // Served only while a file is actually going into the editor. Anywhere
+        // else there is no stream to hold, and accepting the message anyway would
+        // put the panel and the host out of step about whether a write is paused.
+        this.requireState(
+          state,
+          PairPilotState.CREATING_FILE,
+          PairPilotState.WRITING_CODE,
+          'pause the write'
+        );
+        orchestrator.pauseWrite();
+        return;
+
+      case 'resumeWrite':
+        orchestrator.resumeWrite();
+        return;
+
+      case 'requestChangesDuringWrite':
+        // The point of this message is that it arrives *before* the write has
+        // finished, so it is refused once the file is on disk and awaiting
+        // review — at that point `requestChanges` is the honest one, and it works
+        // on a file the developer can read in full.
+        this.requireState(
+          state,
+          PairPilotState.CREATING_FILE,
+          PairPilotState.WRITING_CODE,
+          'request changes to the file being written'
+        );
+        await orchestrator.requestChangesWhileWriting(message.feedback);
+        return;
+
       case 'approveFileCreation':
         // Legal only while awaiting permission for the path.
         this.requireState(state, PairPilotState.WAITING_FILE_APPROVAL, 'approve file creation');
-        await orchestrator.approveFileCreation(message.contentHash);
+        await orchestrator.approveFileCreation(message.contentHash, bindingOf(message));
         return;
 
       case 'rejectFileCreation':
         this.requireState(state, PairPilotState.WAITING_FILE_APPROVAL, 'decline file creation');
-        orchestrator.rejectFileCreation(message.contentHash);
+        orchestrator.rejectFileCreation(message.contentHash, bindingOf(message));
         return;
 
       case 'approveCode':
@@ -97,7 +144,7 @@ export class WebviewMessageRouter {
           PairPilotState.REVIEWING,
           'approve code'
         );
-        await orchestrator.approveCode(message.contentHash);
+        await orchestrator.approveCode(message.contentHash, bindingOf(message));
         return;
 
       case 'rejectCode':
@@ -107,7 +154,7 @@ export class WebviewMessageRouter {
           PairPilotState.REVIEWING,
           'reject code'
         );
-        await orchestrator.rejectCode(message.contentHash);
+        await orchestrator.rejectCode(message.contentHash, bindingOf(message));
         return;
 
       case 'requestChanges':
@@ -117,7 +164,7 @@ export class WebviewMessageRouter {
           PairPilotState.REVIEWING,
           'request changes'
         );
-        await orchestrator.requestChanges(message.contentHash, message.feedback);
+        await orchestrator.requestChanges(message.contentHash, message.feedback, bindingOf(message));
         return;
 
       case 'acceptRecommendation':

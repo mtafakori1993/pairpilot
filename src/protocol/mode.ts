@@ -676,6 +676,18 @@ const CODING_TYPES: readonly ProtocolMessageType[] = ['code_proposal', ...PLANNI
 const NO_CODE_RULE =
   'Nothing may be written this turn. Do not produce a "code_proposal", do not include file contents, and do not treat any directory layout you describe as an instruction to create it. Describe responsibilities and boundaries in prose and names only.';
 
+/**
+ * The commenting rule for code that will actually be written.
+ *
+ * The developer reads each file as it streams into the real editor, so the
+ * comments are the part that makes that review possible: a section, a class, a
+ * method or a piece of logic that is not obvious has to say what it does and why
+ * it exists. Persian is specified because that is the language the developer
+ * reads in, and a comment they cannot read is not documentation.
+ */
+const CODE_COMMENT_RULE =
+  'Comment the code as you write it: give every class, method and non-obvious block a short Persian comment (فارسی) — use // for a line and /* */ for a block — saying what it does and why it exists. Write the comments in Persian and keep identifiers, keywords and error messages in the original language of the code.';
+
 /** The policy for a mode. Derived from the mode, so it cannot drift from it. */
 export function policyFor(mode: WorkflowMode): WorkflowPolicy {
   switch (mode) {
@@ -750,6 +762,7 @@ export function policyFor(mode: WorkflowMode): WorkflowPolicy {
           [
             'The session is in CODING and the developer has authorised implementation.',
             'Use "code_proposal" with every file the task needs, each carrying its complete final content.',
+            CODE_COMMENT_RULE,
             'Use "chat_response" if the instruction turns out to be a question, and "clarification_request" if a genuine ambiguity blocks you.',
           ].join('\n'),
       };
