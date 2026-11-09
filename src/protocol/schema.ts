@@ -266,6 +266,86 @@ function matchVocabulary<T extends string>(
 /* -------------------------------------------------------------------------- */
 
 /**
+ * The canonical shape of one change, in the words a corrective retry needs.
+ *
+ * Repeated in every message that has to explain the structure, because each of
+ * those messages is read on its own: a model that omitted `file` is told what a
+ * change looks like, not pointed at another issue that happens to say so.
+ */
+const CHANGE_SHAPE =
+  'A change is an object with "file" (the workspace-relative path, such as "src/User.php"), "operation" ("create" or "update"), "description" (one sentence about what it does) and "content" (the complete file).';
+
+/** How many of an unexpected object's keys are quoted back. */
+const MAX_REPORTED_KEYS = 12;
+
+/** The keys a change carried, for a diagnostic that has to name what arrived. */
+function describeKeys(raw: Record<string, unknown>): string {
+  const keys = Object.keys(raw).slice(0, MAX_REPORTED_KEYS);
+  if (keys.length === 0) {
+    return 'It was an empty object.';
+  }
+  const quoted = keys.map((key) => `"${key}"`).join(', ');
+  const more = Object.keys(raw).length > keys.length ? ', and more' : '';
+  return `It carried ${quoted}${more}.`;
+}
+
+/**
+ * Read the target path of a change.
+ *
+ * `file` gets its own reader rather than the generic `requiredString` because
+ * this is the field a reply most often loses, and the generic message — "The
+ * "file" field is required and was not present" — is the one the developer
+ * reported: true, and useless. It does not say which change, does not say what
+ * *did* arrive, and does not say what a change should look like. A model that
+ * wrote `fileName`, or `path`, or an object of lines, is one key away from being
+ * correct, and the diagnostic that tells it so is the difference between a
+ * retry that works and one that repeats itself.
+ */
+function readFilePath(
+  raw: Record<string, unknown>,
+  path: string,
+  index: number,
+  issues: ProtocolIssue[]
+): string {
+  const value = raw['file'];
+  if (value === undefined || value === null) {
+    issues.push({
+      path: `${path}/file`,
+      code: 'missing_field',
+      message:
+        `Change ${index + 1} has no "file", so PairPilot does not know which file it applies to. ` +
+        `${describeKeys(raw)} ${CHANGE_SHAPE}`,
+    });
+    return '';
+  }
+  if (typeof value !== 'string') {
+    issues.push({
+      path: `${path}/file`,
+      code: 'wrong_type',
+      message: `"file" must be a string holding the workspace-relative path but arrived as ${describeType(value)}. ${CHANGE_SHAPE}`,
+    });
+    return '';
+  }
+  if (value.trim().length === 0) {
+    issues.push({
+      path: `${path}/file`,
+      code: 'empty_value',
+      message: `Change ${index + 1} has an empty "file", so PairPilot does not know which file it applies to. ${CHANGE_SHAPE}`,
+    });
+    return '';
+  }
+  if (value.length > PROTOCOL_LIMITS.maxPathChars) {
+    issues.push({
+      path: `${path}/file`,
+      code: 'too_large',
+      message: `"file" is ${value.length} characters; the maximum is ${PROTOCOL_LIMITS.maxPathChars}.`,
+    });
+    return value.slice(0, PROTOCOL_LIMITS.maxPathChars);
+  }
+  return value;
+}
+
+/**
  * Validate one change.
  *
  * Returns null and pushes issues when the change cannot be used. A change that
@@ -283,14 +363,14 @@ function readChange(
     issues.push({
       path,
       code: 'not_an_object',
-      message: `Change ${index + 1} must be a JSON object but arrived as ${describeType(raw)}.`,
+      message: `Change ${index + 1} must be a JSON object but arrived as ${describeType(raw)}. ${CHANGE_SHAPE}`,
     });
     return null;
   }
 
   const before = issues.length;
 
-  const file = requiredString(raw, 'file', path, issues, { maxChars: PROTOCOL_LIMITS.maxPathChars });
+  const file = readFilePath(raw, path, index, issues);
   const description = requiredString(raw, 'description', path, issues, {
     maxChars: PROTOCOL_LIMITS.maxDescriptionChars,
   });
@@ -311,7 +391,7 @@ function readChange(
         path: `${path}/content`,
         code: 'missing_field',
         message:
-          'Each change must carry the complete file content in "content". PairPilot writes exactly what you reviewed, so a change with no content cannot be applied.',
+          `Change ${index + 1} ("${file || 'unnamed'}") carries no "content". PairPilot writes exactly what you reviewed, so a change with no content cannot be applied — send the complete final file.`,
       });
     } else if (typeof raw['content'] !== 'string') {
       issues.push({
@@ -342,14 +422,13 @@ function readChange(
     issues.push({
       path: `${path}/operation`,
       code: 'missing_field',
-      message:
-        'Each change must state its "operation". Use "create" for a new file and "update" to replace an existing one.',
+      message: `Change ${index + 1} ("${file || 'unnamed'}") does not state its "operation". Use "create" for a new file and "update" to replace an existing one.`,
     });
   } else if (operationMatch === undefined) {
     issues.push({
       path: `${path}/operation`,
       code: 'unknown_operation',
-      message: `Unsupported operation "${String(operationRaw)}". Use "create" or "update".`,
+      message: `Change ${index + 1} ("${file || 'unnamed'}") has an unsupported operation "${String(operationRaw)}". Use "create" or "update".`,
     });
   } else if (isReserved) {
     // Reported, never silently dropped: the model is told what PairPilot can

@@ -611,8 +611,85 @@ describe('an invalid reply', () => {
     expect(ai.turnCount).toBe(2);
     // The correction must name the field, not say "try again".
     expect(ai.prompts[1]).toMatch(/content/i);
+    // And it must say what to send instead. A complaint without the expected
+    // shape is how a retry comes back with a different field misnamed.
+    expect(ai.prompts[1]).toContain('"changes"');
+    expect(ai.prompts[1]).toContain('"file"');
+    expect(ai.prompts[1]).toContain('"operation"');
+    expect(ai.prompts[1]).toContain('"content"');
     expect(orchestrator.errorValue).toBeNull();
     expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+  });
+
+  it('answers a valid reply of another type rather than demanding a proposal', async () => {
+    // The developer asked for implementation, so the turn asked for a proposal.
+    // The model answered with a question instead. That is a reply, not a broken
+    // contract, and it is handled by the handler for the type it declared.
+    const ai = new ScriptedAI(
+      JSON.stringify({
+        type: 'clarification_request',
+        message: 'Before I write this: which database?',
+        clarification: { question: 'Which database?', options: ['SQLite', 'Postgres'] },
+      })
+    );
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(ai.turnCount).toBe(1);
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.approvals.getPending()).toBeNull();
+    expect(fs.existsSync(path.join(root, 'src', 'Domain'))).toBe(false);
+  });
+
+  it('stages a proposal whose path arrived under another name', async () => {
+    // The reported failure, end to end. The path is present; only its spelling
+    // differs. Refusing this cost the developer the whole turn, and the repair
+    // is a rename the parser can perform without guessing at anything.
+    const renamed = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'A user module.',
+      changes: [
+        {
+          fileName: 'src/Domain/User.php',
+          operation: 'create',
+          description: 'The User entity.',
+          content: '<?php\n\nfinal class User {}\n',
+        },
+      ],
+    });
+    const ai = new ScriptedAI(renamed);
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(ai.turnCount).toBe(1);
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.changeSetPlanValue.map((entry) => entry.file)).toEqual([
+      'src/Domain/User.php',
+    ]);
+    // Staged, still not written: renaming a key is not authorisation.
+    expect(fs.existsSync(path.join(root, 'src', 'Domain', 'User.php'))).toBe(false);
+  });
+
+  it('writes nothing at all when the reply never passes validation', async () => {
+    const broken = JSON.stringify({
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [{ file: 'src/Domain/User.php', operation: 'create', description: 'No content' }],
+    });
+    const ai = new ScriptedAI(broken, broken, broken, broken);
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(orchestrator.errorValue).not.toBeNull();
+    // Nothing reached the filesystem, and no placeholder was created to stand in
+    // for the content that never arrived.
+    expect(fs.readdirSync(path.join(root, 'src'))).toEqual(['existing.ts']);
+    expect(fs.existsSync(path.join(root, 'src', 'Domain'))).toBe(false);
+    expect(orchestrator.batchView).toBeNull();
   });
 
   it('gives up after the retry budget rather than looping', async () => {

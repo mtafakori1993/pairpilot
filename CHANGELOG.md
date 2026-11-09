@@ -4,6 +4,91 @@ All notable changes to PairPilot are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1]
+
+A follow-up to the report of:
+
+```
+The reply was valid JSON but did not match the PairPilot response contract.
+/changes/0/file — The "file" field is required and was not present.
+```
+
+The developer had asked for implementation, the session was in Coding, and the
+model's reply was refused for a field it had — under another name. The path is the
+field a reply most easily misnames, and the diagnostic said only that `file` was
+absent: it did not say which change, did not say what *had* arrived, and did not
+say what a change should look like. A corrective retry with nothing to correct
+comes back with a different field misnamed.
+
+### Fixed
+
+- **A path sent as `fileName`, `relativePath`, `file_path`, `path`, `target` or
+  any of ten other spellings was refused as missing.** Adaptation already
+  renamed key names, but its list of aliases stopped short of the spellings
+  models actually use — and the reply was rejected as incomplete while the path
+  sat one key away. The aliases now cover the unambiguous spellings, and every
+  rename is recorded as an adaptation note, so a reply that adapted cleanly is no
+  longer indistinguishable from one that matched the contract on the nose. What
+  is *not* done is inventing a path: a change with no path under any name is
+  still refused, because guessing one would put a file in front of the developer
+  that nobody proposed.
+- **A change list sent under `files` was recognised and then thrown away.**
+  `adaptCandidate` accepted a root-level `files` array as the change list, and
+  nothing renamed it to `changes`, so validation refused the reply for carrying no
+  `changes`. The diagnostic blamed the model for a reply adaptation had already
+  accepted. It is now renamed, and noted.
+- **A change that was not an object produced four misleading complaints.** The
+  element was wrapped in an object so that validation could report it — which
+  made it an object, so validation reported four missing fields against a change
+  that had no fields at all. It is now passed through untouched and reported for
+  what it is: `Change 1 must be a JSON object but arrived as a string.`
+- **A missing field said nothing about what was expected.** The reported message
+  is replaced by one that names the change in the developer's own counting, quotes
+  the keys that *did* arrive, and states the shape that was expected. The
+  `content` and `operation` complaints gained the change index and path for the
+  same reason: each of these messages is read on its own, by a model that has to
+  decide what to send next.
+- **The corrective retry carried the complaint but not the contract.** The retry
+  prompt now restates the exact structure a `code_proposal` must have — the four
+  fields every change carries, in the spelling the host parses — because a model
+  asked only "what was wrong?" can fix that field and misname the next one. The
+  retry budget is unchanged at two, and a retry still never re-enters the state
+  machine: only the first attempt transitions.
+- **The prompt now states which fields are required.** The example was correct;
+  the rules below it named `file`, `operation` and `content` and left
+  `description` to be inferred from the example.
+- **A dangling `this.roadmapGenerated = false;` in `resetTurnState()`.** The
+  field is declared nowhere in the repository — the 0.3.0 commit contained a
+  reference to it, and `tsc --noEmit` fails on it with `TS2339`. Removed. The
+  roadmap *prompt* and the plan-leading-to-coding transition are untouched; what
+  is gone is a leftover assignment from a feature this build does not have.
+
+### Added
+
+- **A `content` given as an array of lines is joined** with newlines, and noted.
+  The lines are the model's own, in its own order; nothing is added between them
+  but a newline. This is shape rewriting, which is what adaptation is for — unlike
+  inventing content, which it must never do.
+- **A valid reply of another type is answered as that type.** Twenty-one tests
+  pin the mapping — `chat_response`, `engineering_advice`,
+  `clarification_request`, `project_analysis`, `project_plan`,
+  `architecture_discussion`, `code_review`, `task_update` and `error` — because
+  coercing a reply into `code_proposal` on an implementation turn is how "the
+  model asked a question" becomes "the model failed the contract". A
+  `chat_response` that also carries a `changes` array is still a chat response.
+
+### Verification
+
+- 1040 unit tests across 32 files, including the eight cases this report asked
+  for: a missing `file`, a missing `type`, missing content for create and for
+  update, nested proposal structures, a wrong response type, malformed JSON, a
+  successful corrected retry, and no filesystem writes after a validation
+  failure.
+- 12 cases in a real VS Code Extension Development Host, unchanged.
+- `tsc --noEmit` clean. NOTE: the 0.3.0 commit did **not** typecheck — the
+  dangling `roadmapGenerated` reference was in it, and an earlier check of that
+  tree reported otherwise. It is fixed here.
+
 ## [0.3.0]
 
 This release is about the multi-file proposal, end to end. Approving seven files

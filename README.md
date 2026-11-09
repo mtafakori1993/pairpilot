@@ -358,7 +358,7 @@ Development Host.
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 1005 unit and security tests
+npm test                 # 1040 unit and security tests
 npm run test:live        # opt-in: 8 real-CLI protocol tests
 npm run test:vscode      # opt-in: 12 extension-host tests
 npm run package          # production build + VSIX
@@ -368,6 +368,14 @@ npm run package          # production build + VSIX
 containment, approval hashing, message validation, argument sanitisation, and the
 streaming JSON scanner — is deliberately pure Node, so it is tested directly
 rather than through a mocked `vscode` module.
+
+The response protocol is tested the same way, and it is the part with the most
+tests per line of code, because it is where a model's reply becomes something
+PairPilot will act on. Three layers are pinned separately: extraction (a payload
+wrapped in prose, a fenced block, braces inside source strings), adaptation (the
+shapes a model actually sends — a nested `proposal`, a change list under `files`,
+a path spelled `fileName`, content as an array of lines), and validation (which
+fields a change must carry, and what the diagnostic says when one is missing).
 
 The provider and model subsystem is built the same way, which is why it is
 testable at all: catalogue normalisation, search, advisor scoring, selection
@@ -450,6 +458,19 @@ Worth recording, because it is the argument for having them:
   matched the proposal and the read-back verification rejected it. An `update`
   could not succeed at all. Only the editor-host suite could see this, because the
   defect is in what a real `TextDocument` contains after an edit.
+- **A reply was refused for a field it had, under another name.** A model that
+  wrote `fileName` instead of `file` had its whole proposal rejected with
+  "The "file" field is required and was not present" — true, and useless: it did
+  not say which change, did not say what had arrived, and did not name the shape
+  expected. The alias list stopped one spelling short of what models write, and
+  the message described the absence rather than the difference. Both halves are
+  fixed: the spelling is read, and a path that is genuinely absent is reported
+  with the keys that did arrive and the structure that was expected.
+- **A recognised shape was discarded one stage later.** Adaptation accepted a
+  change list sent under `files` and nothing renamed it, so validation refused the
+  reply for carrying no `changes`. The model was blamed for a reply the pipeline
+  had already understood — the same defect as the batch one above, one layer down:
+  the two stages disagreed about what they were passing.
 
 ## Architecture
 

@@ -28,6 +28,7 @@ import { interpretTurn, renderMessage } from '../../src/proposals/TurnInterprete
 import { classifyTurnIntent } from '../../src/protocol/classify';
 import { ProtocolDiagnostics, redactSecrets } from '../../src/protocol/diagnostics';
 import { PAIRPILOT_PROTOCOL_VERSION } from '../../src/protocol/types';
+import { buildCorrectionPrompt } from '../../src/runtime/prompts';
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -940,5 +941,367 @@ describe('schema contract', () => {
     if (result.ok) {
       expect(result.value.protocol_version).toBe(PAIRPILOT_PROTOCOL_VERSION);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The reported contract mismatch                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The second reported failure, replayed.
+ *
+ *     The reply was valid JSON but did not match the PairPilot response contract.
+ *     /changes/0/file — The "file" field is required and was not present.
+ *
+ * The developer had asked for implementation, the session was in Coding, and the
+ * model's reply was refused for a field it had — under another name. The path
+ * field is the one a reply most easily misnames (`fileName`, `relativePath`,
+ * `file_path`, `path`), and the diagnostic that came out of it said only that
+ * `file` was absent. Nothing told the model what a change should look like, so a
+ * corrective retry had nothing to correct.
+ *
+ * These tests pin the whole class: every spelling of the path that is
+ * unambiguous is read, a path that is genuinely absent is reported once with the
+ * keys that *did* arrive and the shape that was expected, and no refusal invents
+ * a path to write.
+ */
+describe('the path field a reply lost', () => {
+  const canonicalRest = {
+    operation: 'create',
+    description: 'A user entity.',
+    content: '<?php\n\nfinal class User {}\n',
+  };
+
+  it.each([
+    ['fileName', 'fileName'],
+    ['file_name', 'file_name'],
+    ['relativePath', 'relativePath'],
+    ['relative_path', 'relative_path'],
+    ['file_path', 'file_path'],
+    ['filePath', 'filePath'],
+    ['path', 'path'],
+    ['target_file', 'target_file'],
+  ])('reads %s as the target path', (_label, key) => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Here it is.',
+      changes: [{ [key]: 'src/User.php', ...canonicalRest }],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok, JSON.stringify(!outcome.ok ? outcome.issues : [])).toBe(true);
+    if (outcome.ok && outcome.message.type === 'code_proposal') {
+      expect(outcome.message.changes[0]!.file).toBe('src/User.php');
+      // The rename is recorded: a reply that adapted is not the same as one that
+      // matched the contract, and the diagnostics panel has to be able to say so.
+      expect(outcome.notes.join(' ')).toContain(key);
+    }
+  });
+
+  it('refuses a change with no path at all, naming the change and the shape', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Here it is.',
+      changes: [canonicalRest],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) {
+      return;
+    }
+
+    // One complaint, not four: the change had three of its four fields, and the
+    // developer is told about the one that is missing.
+    expect(outcome.issues).toHaveLength(1);
+    const issue = outcome.issues[0]!;
+    expect(issue.path).toBe('/changes/0/file');
+    expect(issue.code).toBe('missing_field');
+    // Which change, in the developer's own counting.
+    expect(issue.message).toMatch(/Change 1/);
+    // What actually arrived, so the misnamed field is visible.
+    expect(issue.message).toContain('"operation"');
+    expect(issue.message).toContain('"content"');
+    // And what was expected instead.
+    expect(issue.message).toMatch(/"operation" \("create" or "update"\)/);
+    expect(issue.message).toMatch(/workspace-relative path/);
+  });
+
+  it('invents no path when the field is missing', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Here it is.',
+      changes: [canonicalRest],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    // Nothing to write, and nothing silently filled in: a proposal with an
+    // invented path would be a file the developer never reviewed.
+    expect(outcome.ok).toBe(false);
+    expect(interpretTurn(JSON.stringify(reply)).kind).toBe('failure');
+  });
+
+  it('reports a non-object change as such, once', () => {
+    const reply = { type: 'code_proposal', message: 'Done.', changes: ['src/a.ts'] };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      // The change was a string, and that is what the developer is told. Four
+      // missing-field complaints about a change that has no fields at all is how
+      // this used to read.
+      expect(outcome.issues).toHaveLength(1);
+      expect(outcome.issues[0]!.code).toBe('not_an_object');
+      expect(outcome.issues[0]!.message).toMatch(/arrived as a string/);
+      expect(outcome.issues[0]!.message).toMatch(/must be a JSON object/i);
+    }
+  });
+
+  it('reads a nested proposal carrying a canonical changes array', () => {
+    // The 0.1.x nested shape, with the change list spelled the canonical way.
+    // Both halves have to work at once: the payload lifted out of `proposal`,
+    // and its changes read as changes.
+    const reply = {
+      type: 'code_proposal',
+      message: 'Here it is.',
+      proposal: {
+        changes: [
+          { file: 'src/Domain/User.php', ...canonicalRest },
+          {
+            file: 'src/Infrastructure/UserRepository.php',
+            operation: 'update',
+            description: 'The repository.',
+            content: '<?php\n\nfinal class UserRepository {}\n',
+          },
+        ],
+      },
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok, JSON.stringify(!outcome.ok ? outcome.issues : [])).toBe(true);
+    if (outcome.ok && outcome.message.type === 'code_proposal') {
+      expect(outcome.message.changes.map((change) => change.file)).toEqual([
+        'src/Domain/User.php',
+        'src/Infrastructure/UserRepository.php',
+      ]);
+      expect(outcome.adaptation).toBe('nested_proposal');
+    }
+  });
+
+  it('reads a change list sent under "files"', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Here it is.',
+      files: [{ file: 'src/User.php', ...canonicalRest }],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok, JSON.stringify(!outcome.ok ? outcome.issues : [])).toBe(true);
+    if (outcome.ok && outcome.message.type === 'code_proposal') {
+      expect(outcome.message.changes).toHaveLength(1);
+      expect(outcome.notes.join(' ')).toMatch(/files/i);
+    }
+  });
+
+  it('joins a content array into the string the contract carries', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Here it is.',
+      changes: [
+        {
+          file: 'src/User.php',
+          operation: 'create',
+          description: 'A user entity.',
+          content: ['<?php', '', 'final class User {}', ''],
+        },
+      ],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok, JSON.stringify(!outcome.ok ? outcome.issues : [])).toBe(true);
+    if (outcome.ok && outcome.message.type === 'code_proposal') {
+      expect(outcome.message.changes[0]!.content).toBe('<?php\n\nfinal class User {}\n');
+    }
+  });
+
+  it('still refuses a genuinely empty change, and says what was missing', () => {
+    const reply = { type: 'code_proposal', message: 'Done.', changes: [{}] };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      const fileIssue = outcome.issues.find((issue) => issue.path === '/changes/0/file');
+      expect(fileIssue).toBeDefined();
+      expect(fileIssue!.message).toMatch(/empty object/i);
+    }
+  });
+});
+
+describe('the required fields, one at a time', () => {
+  it('refuses a change with no operation', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [
+        { file: 'src/a.ts', description: 'A file', content: 'export const a = 1;\n' },
+      ],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      const issue = outcome.issues.find((entry) => entry.path === '/changes/0/operation');
+      expect(issue, JSON.stringify(outcome.issues)).toBeDefined();
+      expect(issue!.code).toBe('missing_field');
+      expect(issue!.message).toMatch(/Change 1/);
+      expect(issue!.message).toMatch(/"create" for a new file/);
+    }
+  });
+
+  it('reads "type" as the operation, as the reported contract names it', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [
+        { file: 'src/a.ts', type: 'create', description: 'A file', content: 'export const a = 1;\n' },
+      ],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok, JSON.stringify(!outcome.ok ? outcome.issues : [])).toBe(true);
+    if (outcome.ok && outcome.message.type === 'code_proposal') {
+      expect(outcome.message.changes[0]!.operation).toBe('create');
+    }
+  });
+
+  it('refuses a create with no content', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [{ file: 'src/a.ts', operation: 'create', description: 'A file' }],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues).toHaveLength(1);
+      const issue = outcome.issues[0]!;
+      expect(issue.path).toBe('/changes/0/content');
+      expect(issue.message).toMatch(/Change 1/);
+      expect(issue.message).toMatch(/src\/a\.ts/);
+      expect(issue.message).toMatch(/complete final file/);
+    }
+  });
+
+  it('refuses an update with no content, exactly as it refuses a create', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [{ file: 'src/a.ts', operation: 'update', description: 'A file' }],
+    };
+    expect(parseProtocol(JSON.stringify(reply)).ok).toBe(false);
+  });
+
+  it('refuses content that is not a string', () => {
+    const reply = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [{ file: 'src/a.ts', operation: 'create', description: 'A file', content: 42 }],
+    };
+    const outcome = parseProtocol(JSON.stringify(reply));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues[0]!.code).toBe('wrong_type');
+    }
+  });
+});
+
+describe('a reply of a different type', () => {
+  it.each([
+    ['chat_response', 'narrative'],
+    ['engineering_advice', 'advice'],
+    ['clarification_request', 'question'],
+    ['project_analysis', 'narrative'],
+    ['project_plan', 'narrative'],
+    ['architecture_discussion', 'narrative'],
+    ['code_review', 'narrative'],
+    ['task_update', 'narrative'],
+    ['error', 'narrative'],
+  ])('handles %s with its own handler, not as a proposal', (type, expected) => {
+    const bodies: Record<string, Record<string, unknown>> = {
+      chat_response: { message: 'Here is what I would do.' },
+      engineering_advice: {
+        message: 'Next step.',
+        advice: { title: 'Add a repository interface', reason: 'It is untestable without one.' },
+      },
+      clarification_request: {
+        message: 'Which database?',
+        clarification: { question: 'Which database?', options: ['SQLite', 'Postgres'] },
+      },
+      project_analysis: { message: 'Analysed.', analysis: { stack: ['PHP 8.3'] } },
+      project_plan: {
+        message: 'Planned.',
+        plan: { phases: [{ name: 'Foundation', goal: 'A skeleton', tasks: ['Set it up'] }] },
+      },
+      architecture_discussion: { message: 'Discussed.', requirements: ['Users'] },
+      code_review: { message: 'Reviewed.', review: { verdict: 'concerns' } },
+      task_update: { message: 'Done.', task: { title: 'Build it', status: 'completed' } },
+      error: { message: 'Could not comply.', error: { detail: 'No.' } },
+    };
+
+    // A valid reply of another type is answered as what it is. It is never
+    // coerced into a code_proposal: doing that on an implementation turn is how
+    // "the model asked a question" becomes "the model failed the contract".
+    const interpretation = interpretTurn(JSON.stringify({ type, ...bodies[type] }));
+    expect(interpretation.kind).toBe(expected);
+    if (interpretation.kind === 'failure') {
+      throw new Error(`expected ${type} to be handled, got failure: ${interpretation.failure.reason}`);
+    }
+    expect(interpretation.message.type).toBe(type);
+  });
+
+  it('does not coerce a chat_response that also carries a changes array', () => {
+    // The model is allowed to be conversational and thorough at once. The type
+    // it declared is what it is answered as.
+    const reply = {
+      type: 'chat_response',
+      message: 'Here is the approach I would take.',
+      changes: [{ file: 'src/a.ts', operation: 'create', description: 'A file', content: 'x\n' }],
+    };
+    const interpretation = interpretTurn(JSON.stringify(reply));
+    expect(interpretation.kind).toBe('narrative');
+  });
+});
+
+describe('a corrected retry', () => {
+  it('carries the expected structure back to the model, not only the complaint', () => {
+    const issues = [
+      { path: '/changes/0/file', code: 'missing_field', message: 'Change 1 has no "file".' },
+    ];
+    const prompt = buildCorrectionPrompt(issues);
+
+    // The complaint, against the JSON path the validator used.
+    expect(prompt).toContain('/changes/0/file');
+    expect(prompt).toContain('Change 1 has no "file".');
+    // And the shape to send instead, spelled the way the host parses it.
+    expect(prompt).toContain('"changes"');
+    expect(prompt).toContain('"file"');
+    expect(prompt).toContain('"operation"');
+    expect(prompt).toContain('"content"');
+    expect(prompt).toMatch(/"create" or "update"/);
+    expect(prompt).toMatch(/ONE complete, corrected JSON object/);
+  });
+
+  it('accepts the corrected reply on the second attempt', () => {
+    // The first attempt is refused; the second is the same proposal, fixed.
+    const broken = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [{ file: 'src/a.ts', operation: 'create', description: 'A file' }],
+    };
+    const first = interpretTurn(JSON.stringify(broken));
+    expect(first.kind).toBe('failure');
+    if (first.kind === 'failure') {
+      expect(first.retryable).toBe(true);
+    }
+
+    const fixed = {
+      type: 'code_proposal',
+      message: 'Done.',
+      changes: [
+        { file: 'src/a.ts', operation: 'create', description: 'A file', content: 'x\n' },
+      ],
+    };
+    expect(interpretTurn(JSON.stringify(fixed)).kind).toBe('proposal');
   });
 });

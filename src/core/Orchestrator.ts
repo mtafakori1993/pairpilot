@@ -2158,7 +2158,6 @@ export class Orchestrator {
 
   /** Clear everything a finished turn leaves behind. */
   private resetTurnState(): void {
-    this.roadmapGenerated = false;
     this.approvals.reset();
     this.pinnedContext.clear();
     this.lastContextFiles = [];

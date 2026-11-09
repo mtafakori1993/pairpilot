@@ -46,25 +46,80 @@ export interface AdaptedCandidate {
 }
 
 /** Keys a model might use for the same concept, in priority order. */
-const FILE_KEYS = ['file', 'filePath', 'filepath', 'path', 'filename', 'target'] as const;
-const CONTENT_KEYS = ['content', 'code', 'source', 'text', 'body', 'newContent'] as const;
-const OPERATION_KEYS = ['operation', 'type', 'action', 'op', 'changeType'] as const;
+const FILE_KEYS = [
+  'file',
+  'filePath',
+  'filepath',
+  'file_path',
+  'path',
+  'relativePath',
+  'relative_path',
+  'relPath',
+  'filename',
+  'fileName',
+  'file_name',
+  'target',
+  'targetFile',
+  'target_file',
+] as const;
+const CONTENT_KEYS = [
+  'content',
+  'code',
+  'source',
+  'text',
+  'body',
+  'newContent',
+  'new_content',
+  'newString',
+  'newCode',
+  'contents',
+  'fileContent',
+  'file_content',
+  'fullContent',
+  'full_content',
+] as const;
+const OPERATION_KEYS = [
+  'operation',
+  'type',
+  'action',
+  'op',
+  'changeType',
+  'change_type',
+  'opType',
+  'op_type',
+] as const;
 const DESCRIPTION_KEYS = ['description', 'summary', 'title', 'purpose'] as const;
 const DEPENDENCY_KEYS = ['dependencies', 'dependsOn', 'requires', 'imports'] as const;
 const MESSAGE_KEYS = ['message', 'explanation', 'text', 'summary', 'response'] as const;
 
-/** Read the first key that is present and non-empty, in priority order. */
-function pick(source: Record<string, unknown>, keys: readonly string[]): unknown {
+/**
+ * Read the first key that is present and non-empty, in priority order.
+ *
+ * The key is returned alongside the value because *which* key answered is the
+ * single most useful fact when a reply is refused. A model that writes
+ * `fileName` instead of `file` is not wrong about the meaning, and a diagnostic
+ * that only says `file` was "not present" leaves the developer to diff the model
+ * against the contract by eye. `pickKey` lets adaptation say what it renamed.
+ */
+function pickKey(
+  source: Record<string, unknown>,
+  keys: readonly string[]
+): { key: string; value: unknown } | undefined {
   for (const key of keys) {
     const value = source[key];
     if (value !== undefined && value !== null) {
       if (typeof value === 'string' && value.trim().length === 0) {
         continue;
       }
-      return value;
+      return { key, value };
     }
   }
   return undefined;
+}
+
+/** Read the first key that is present and non-empty, in priority order. */
+function pick(source: Record<string, unknown>, keys: readonly string[]): unknown {
+  return pickKey(source, keys)?.value;
 }
 
 function asString(value: unknown): string | undefined {
@@ -106,20 +161,55 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * pieces. Those are joined with newlines, which is exactly how the 0.1.x writer
  * assembled them, so the resulting content matches byte for byte what the
  * developer would have reviewed then.
+ *
+ * A non-object element is returned **untouched**, not wrapped. Wrapping it — the
+ * earlier behaviour — made it an object, so validation no longer recognised it as
+ * "a string arrived where an object was required" and instead reported four
+ * missing fields against a change that had no fields at all. One accurate
+ * complaint is worth four misleading ones, and the accurate one is the only one
+ * a corrective retry can act on.
  */
-function adaptChange(raw: unknown, index: number, notes: string[]): Record<string, unknown> {
+function adaptChange(raw: unknown, index: number, notes: string[]): unknown {
   if (!isRecord(raw)) {
-    // Leave the value untouched so validation reports "must be an object"
-    // against the path the model actually sent.
-    return { __unadapted: raw } as unknown as Record<string, unknown>;
+    return raw;
   }
 
-  const file = pick(raw, FILE_KEYS);
-  const operation = pick(raw, OPERATION_KEYS);
-  const description = pick(raw, DESCRIPTION_KEYS);
+  const fileKey = pickKey(raw, FILE_KEYS);
+  const operationKey = pickKey(raw, OPERATION_KEYS);
+  const descriptionPicker = pickKey(raw, DESCRIPTION_KEYS);
   const dependencies = pick(raw, DEPENDENCY_KEYS);
+  const contentKey = pickKey(raw, CONTENT_KEYS);
 
-  let content = pick(raw, CONTENT_KEYS);
+  const file = fileKey?.value;
+  const operation = operationKey?.value;
+  const description = descriptionPicker?.value;
+
+  // Every rename is recorded. The diagnostic panel is the only place a
+  // developer can see that the model said `fileName` and that PairPilot read it
+  // — without this, a reply that adapted cleanly is indistinguishable from one
+  // that matched the contract on the nose.
+  const rename = (from: string | undefined, to: string): void => {
+    if (from !== undefined && from !== to) {
+      notes.push(`Change ${index + 1}: read "${from}" as "${to}".`);
+    }
+  };
+  rename(fileKey?.key, 'file');
+  rename(operationKey?.key, 'operation');
+  rename(descriptionPicker?.key, 'description');
+  rename(contentKey?.key, 'content');
+
+  let content = contentKey?.value;
+
+  // A `content` given as an array of lines — which is how a model occasionally
+  // serialises a heredoc. Joining is shape rewriting: the lines are the model's
+  // own, in its own order, and nothing is added between them but a newline.
+  if (Array.isArray(content) && content.every((line) => typeof line === 'string')) {
+    const lines = content as string[];
+    content = lines.join('\n');
+    notes.push(
+      `Change ${index + 1}: joined ${lines.length} lines of a "content" array into the single string the contract carries.`
+    );
+  }
 
   // Legacy `blocks[]`: join the pieces the way the 0.1.x writer did.
   if (content === undefined && Array.isArray(raw['blocks'])) {
@@ -153,7 +243,13 @@ function adaptChange(raw: unknown, index: number, notes: string[]): Record<strin
     raw['potentialProblems'] ?? raw['risks'] ?? raw['problems']
   );
 
-  const out: Record<string, unknown> = {};
+  // The model's own keys are carried through beneath the canonical ones. Nothing
+  // reads them — validation constructs its output field by field — but they are
+  // what lets a refusal name the fields that *did* arrive ("it carried:
+  // fileName, body") instead of only the one that did not. Dropping them here is
+  // how the reported failure came to say `file` was absent while saying nothing
+  // about the path sitting one key away.
+  const out: Record<string, unknown> = { ...raw };
   if (file !== undefined) out['file'] = file;
   if (operation !== undefined) out['operation'] = operation;
   if (description !== undefined) out['description'] = description;
@@ -324,6 +420,18 @@ function finish(
 ): AdaptedCandidate {
   const out: Record<string, unknown> = { ...value };
 
+  // A root-level `files` array is the other name models give the change list.
+  // `adaptCandidate` accepts it as an envelope — and until this ran, nothing
+  // turned it into `changes`, so a reply that had been recognised as a proposal
+  // was then refused for carrying no `changes`. Recognising a shape and then
+  // discarding it is worse than not recognising it: the diagnostic blamed the
+  // model for a reply adaptation had already accepted.
+  if (!Array.isArray(out['changes']) && Array.isArray(out['files'])) {
+    out['changes'] = out['files'];
+    delete out['files'];
+    notes.push('The reply listed its changes under "files"; they were read as "changes".');
+  }
+
   if (!asString(out['type'])) {
     // A reply with `changes` and no type can only have meant a proposal.
     if (Array.isArray(out['changes'])) {
@@ -335,7 +443,9 @@ function finish(
   if (Array.isArray(out['changes'])) {
     out['changes'] = (out['changes'] as unknown[]).map((raw, index) => {
       const change = adaptChange(raw, index, notes);
-      if (isRecord(raw) && change['operation'] !== undefined) {
+      // A change that was not an object is left as it arrived, for validation to
+      // report as such. Only an object can have an operation to normalise.
+      if (isRecord(change) && isRecord(raw) && change['operation'] !== undefined) {
         const inferred = inferOperation(change['operation'], notes, index);
         if (inferred === undefined) {
           delete change['operation'];

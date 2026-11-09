@@ -81,6 +81,7 @@ proposal may contain as many files as the task genuinely needs.
 }
 
 Rules for "changes":
+- Every change MUST carry all four of "file", "operation", "description" and "content", spelled exactly like that. The other keys are optional and may be omitted entirely.
 - "file" is the workspace-relative path. "operation" is "create" or "update".
 - "content" MUST be the complete final file content, exactly as it should appear on disk: every import, every line, in order. Never a fragment, never a diff, never a placeholder such as "// rest of the code here". The developer reviews exactly these bytes and they are written verbatim.
 - Escape newlines as \\n so the document stays valid JSON.
@@ -318,6 +319,13 @@ export function buildAdvisorPrompt(input: {
  * was wrong. This restates the exact issues the validator found, against the
  * same JSON paths, and asks for the whole document again — a partial fix would
  * leave the reply unparseable in a new way.
+ *
+ * The required shape is restated too, not just the complaint. A validator issue
+ * says what is missing; it does not say what the whole document should look like,
+ * and a model re-asking itself "so what do I send instead?" is how a retry comes
+ * back with a different field misnamed. The example is the contract's own
+ * minimum: the four fields every change must carry, in the spelling the host
+ * parses.
  */
 export function buildCorrectionPrompt(issues: readonly { path: string; message: string }[]): string {
   const lines = [
@@ -332,6 +340,24 @@ export function buildCorrectionPrompt(issues: readonly { path: string; message: 
     lines.push(`- …and ${issues.length - 12} more problems of the same kind.`);
   }
   lines.push(
+    '',
+    'This is the exact structure a code proposal must have:',
+    '',
+    '{',
+    `  "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}",`,
+    '  "type": "code_proposal",',
+    '  "message": "One sentence about the whole proposal.",',
+    '  "changes": [',
+    '    {',
+    '      "file": "src/Example.php",',
+    '      "operation": "create",',
+    '      "description": "One sentence about this file.",',
+    '      "content": "<?php\\n\\n// the complete file, every line\\n"',
+    '    }',
+    '  ]',
+    '}',
+    '',
+    'Every entry in "changes" needs all four of those fields, spelled exactly that way. "file" is the workspace-relative path; "operation" is "create" or "update"; "content" is the complete final file, never a fragment or a placeholder.',
     '',
     'Reply again with ONE complete, corrected JSON object and nothing else. Do not explain the correction, do not add markdown fences, and do not omit the parts that were already correct.'
   );
