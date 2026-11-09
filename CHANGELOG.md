@@ -46,10 +46,14 @@ actually lands.
   the document to settle *before* installing the manual-edit guard — the order
   matters, because the reload arrives as a document change and a guard installed
   first would read it as the developer editing the file.
-- **A missing content hash was not the failure it looked like.** A decision that
-  arrived without matching content is now refused with the file and the stage
-  named, rather than a generic message. No placeholder or empty file is ever
-  created as a substitute for content that did not arrive.
+- **A refusal says what actually failed.** Every
+  precondition is now checked before the editor is touched, so a file is never
+  created empty and then left that way because the content turned out to be
+  missing further down. A refusal names the file and which check failed — the
+  proposal no longer contains it, its content is empty, its hash moved after
+  approval, its path no longer resolves inside the workspace, or no approval
+  covers it — instead of one generic message. No placeholder or empty file is
+  ever created as a substitute for content that did not arrive.
 
 ### Added
 
