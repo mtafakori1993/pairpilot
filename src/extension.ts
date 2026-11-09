@@ -17,13 +17,25 @@
 import * as vscode from 'vscode';
 import { Orchestrator, type OrchestratorConfig } from './core/Orchestrator';
 import { ClaudeCodeRuntime } from './runtime/ClaudeCodeRuntime';
+import { ClaudeCodeProvider } from './providers/ClaudeCodeProvider';
+import { ProviderRegistry } from './providers/ProviderRegistry';
 import { WorkspaceContext } from './context/WorkspaceContext';
 import { SessionStore } from './storage/SessionStore';
 import { DiffManager } from './editor/DiffManager';
 import { MessageValidator } from './security/MessageValidator';
 import { PairPilotProvider } from './ui/PairPilotProvider';
 import { WebviewMessageRouter } from './ui/WebviewMessageRouter';
+import { ManagementController } from './ui/ManagementController';
+import {
+  catalogNotice,
+  selectionClearedNotice,
+  selectionSetNotice,
+} from './ui/PanelNotices';
+import { ProviderManagementProvider } from './ui/ProviderManagementProvider';
+import { CostDashboardProvider } from './ui/CostDashboardProvider';
 import { registerCommands } from './commands';
+import { registerManagementCommands } from './commands/management';
+import type { ProviderRequest } from './ui/ProviderMessages';
 
 /** Mutable holder so a folder change is picked up without re-activating. */
 class WorkspaceHolder {
@@ -109,9 +121,7 @@ function readConfiguration(): {
 function toOrchestratorConfig(): OrchestratorConfig {
   const config = readConfiguration();
   return {
-    bare: config.bare,
     timeoutMs: config.timeoutMs,
-    extraArgs: config.extraArgs,
     budget: {
       maxFiles: config.maxFiles,
       maxFileBytes: config.maxFileBytes,
@@ -181,6 +191,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const workspace = workspaceHolder.refresh();
 
   const runtime = new ClaudeCodeRuntime(() => readConfiguration().claudePath, logger);
+
+  // The Claude Code CLI is one backend among potentially several. Everything
+  // downstream — the Orchestrator, the UI — talks to the registry instead, so a
+  // second backend is additive rather than a second copy of the workflow.
+  const claudeCode = new ClaudeCodeProvider({
+    runtime,
+    logger,
+    // Read lazily, exactly as `ClaudeCodeRuntime` reads its configured path: a
+    // settings change must apply to the next turn without re-activating.
+    cliOptions: () => {
+      const current = readConfiguration();
+      return { bare: current.bare, extraArgs: current.extraArgs };
+    },
+  });
+  const providers = new ProviderRegistry();
+  providers.register(claudeCode);
   const store = new SessionStore(
     context.workspaceState,
     logger,
@@ -194,11 +220,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(diff.register());
 
   let provider: PairPilotProvider;
+  let management: ManagementController;
 
   const orchestrator = new Orchestrator({
     context,
     logger,
-    runtime,
+    // The Orchestrator names a role, never a provider or a model: which provider
+    // serves the turn, and which model it runs on, are `AIOrchestrator`'s
+    // business. That is what keeps a second backend additive.
+    get ai() {
+      return management.ai;
+    },
     // Late-bound: the orchestrator must see the *current* workspace context.
     get workspace() {
       return workspaceHolder.get() as WorkspaceContext;
@@ -216,11 +248,200 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   provider = new PairPilotProvider(context.extensionUri, {
     orchestrator,
     store,
-    runtime,
+    runtimeStatus: () => providers.activeRuntimeStatus(),
     workspace: () => workspaceHolder.get(),
     logger,
     onMessage: (raw) => router.handle(raw),
   });
+
+  /* ---------------------------------------------------------------------- */
+  /* AI providers, models and cost                                          */
+  /* ---------------------------------------------------------------------- */
+
+  // Held in `let` bindings because the two panels and the controller refer to
+  // each other: the controller tells the panels to re-render, and a panel's
+  // message is handled by the controller.
+  let providersView: ProviderManagementProvider | null = null;
+  let costView: CostDashboardProvider | null = null;
+
+  const refreshPanels = (): void => {
+    providersView?.refresh();
+    costView?.refresh();
+    provider.refresh();
+  };
+
+  management = new ManagementController({
+    context,
+    providers,
+    logger,
+    workspaceRoot: () => workspaceHolder.get()?.workspaceRoot ?? null,
+    sessionId: () => store.getActive()?.id ?? null,
+    onStateChanged: refreshPanels,
+  });
+
+  // Registers the OpenRouter provider and restores the cached catalogue and
+  // selections. Makes no network call of its own.
+  await management.init();
+
+  providersView = new ProviderManagementProvider(context.extensionUri, {
+    builder: management.viewBuilder,
+    logger,
+    handle: (request) => handleProviderRequest(request),
+  });
+
+  costView = new CostDashboardProvider(context.extensionUri, {
+    buildView: (rangeDays) => management.buildCostView(rangeDays),
+    onClearHistory: () => management.clearUsageHistory(),
+    logger,
+  });
+
+  /**
+   * Act on a validated request from the management panel.
+   *
+   * The panel has already checked the shape of everything here and handled the
+   * messages that concern only its own presentation; what arrives is a request
+   * to change state, and each branch either performs it or explains why not.
+   */
+  async function handleProviderRequest(request: ProviderRequest): Promise<void> {
+    // Cleared first, so a sentence can never outlive the action it described.
+    // A branch that has something true to report sets one below; the rest leave
+    // the panel silent rather than repeating what its own state already shows.
+    providersView?.setNotice(null);
+
+    switch (request.type) {
+      case 'ready': {
+        // The first thing that touches the network, and only because the
+        // developer opened this screen. Both calls are no-ops when the catalogue
+        // is fresh and the connection was confirmed moments ago.
+        const refreshed = await management.refreshCatalogIfDue();
+        await management.ensureConnectionChecked();
+        // Only a failure is worth reporting here. An automatic refresh that
+        // worked changes nothing the developer was looking at, but one that
+        // failed explains why the prices on screen are from a previous session.
+        if (refreshed !== null && refreshed.status === 'failed') {
+          providersView?.setNotice(catalogNotice(refreshed));
+        }
+        refreshPanels();
+        return;
+      }
+
+      case 'setApiKey':
+        // The prompt, the toast and the card's own auth state all report this;
+        // a fourth telling in the panel would be noise.
+        await management.promptForApiKey();
+        refreshPanels();
+        return;
+
+      case 'clearApiKey':
+        // The panel asks for confirmation before sending this.
+        await management.disconnect({ confirm: false });
+        refreshPanels();
+        return;
+
+      case 'testConnection':
+        await management.testConnection({ announce: true });
+        refreshPanels();
+        return;
+
+      case 'refreshCatalog': {
+        // Announced in the panel rather than in a toast: this request came from
+        // the panel, which can take thirty seconds to answer and says nothing at
+        // all on screen when it fails.
+        const outcome = await management.refreshCatalog({ announce: false });
+        providersView?.setNotice(catalogNotice(outcome));
+        refreshPanels();
+        return;
+      }
+
+      case 'selectProvider': {
+        await vscode.workspace
+          .getConfiguration('pairpilot')
+          .update('providers.activeProvider', request.providerId, vscode.ConfigurationTarget.Global);
+        management.onConfigurationChanged();
+        refreshPanels();
+        return;
+      }
+
+      case 'setProviderEnabled': {
+        if (request.providerId !== 'openrouter') {
+          return;
+        }
+        await vscode.workspace
+          .getConfiguration('pairpilot')
+          .update('providers.openrouter.enabled', request.enabled, vscode.ConfigurationTarget.Global);
+        management.onConfigurationChanged();
+        refreshPanels();
+        return;
+      }
+
+      case 'toggleFavorite':
+        await management.catalog.toggleFavorite(request.modelId);
+        refreshPanels();
+        return;
+
+      case 'selectModel': {
+        const written = await management.setSelection(
+          request.level,
+          request.key,
+          request.modelId
+        );
+        // Announced only when a selection was actually written. `setSelection`
+        // refuses a model the catalogue does not carry, and saying "now in use"
+        // about a refusal would be the panel lying about its own state.
+        if (written) {
+          providersView?.setNotice(
+            selectionSetNotice(
+              management.catalog.get(request.modelId)?.name ?? request.modelId,
+              request.level,
+              request.key
+            )
+          );
+        }
+        refreshPanels();
+        return;
+      }
+
+      case 'clearSelection': {
+        const cleared = await management.setSelection(request.level, request.key, null);
+        if (cleared) {
+          providersView?.setNotice(selectionClearedNotice(request.level, request.key));
+        }
+        refreshPanels();
+        return;
+      }
+
+      case 'applyAdvice': {
+        const applied = await management.setSelection('role', request.roleId, request.modelId);
+        if (applied) {
+          providersView?.setNotice(
+            selectionSetNotice(
+              management.catalog.get(request.modelId)?.name ?? request.modelId,
+              'role',
+              request.roleId
+            )
+          );
+        }
+        refreshPanels();
+        return;
+      }
+
+      default:
+        // Every other type is handled by the panel itself and never reaches here.
+        logger.warn(`PairPilot received an unhandled management request: ${request.type}`);
+        return;
+    }
+  }
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      ProviderManagementProvider.viewType,
+      providersView,
+      { webviewOptions: { retainContextWhenHidden: false } }
+    ),
+    vscode.window.registerWebviewViewProvider(CostDashboardProvider.viewType, costView, {
+      webviewOptions: { retainContextWhenHidden: false },
+    })
+  );
 
   const validator = new MessageValidator();
 
@@ -290,16 +511,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     logger,
     getWorkspace: () => workspaceHolder.get(),
     checkRuntime: async () => {
-      const status = await runtime.detect();
+      // A deterministic re-check of the active backend: for the CLI that means
+      // probing for the executable, for a remote provider it will mean
+      // validating the connection. Either way the developer asked for this.
+      const status = await providers.active().detect();
+      const suffix = status.executablePath ? ` (${status.executablePath})` : '';
       if (status.available) {
-        void vscode.window.showInformationMessage(
-          `${status.message}${status.executablePath ? ` (${status.executablePath})` : ''}`
-        );
+        void vscode.window.showInformationMessage(`${status.message}${suffix}`);
       } else {
         void vscode.window.showWarningMessage(status.message);
       }
       provider.refresh();
     },
+  });
+
+  registerManagementCommands(context, {
+    management,
+    providersView,
+    costView,
+    logger,
   });
 
   // React to configuration and workspace changes.
@@ -308,7 +538,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (event.affectsConfiguration('pairpilot')) {
         logger.info('PairPilot configuration changed.');
         workspaceHolder.refresh();
-        provider.refresh();
+        // Which provider is active, the base URL and the budget are all settings
+        // that must apply to the next turn without a reload.
+        management.onConfigurationChanged();
+        refreshPanels();
       }
     })
   );
@@ -322,7 +555,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
-    runtime.onDidChangeStatus(() => provider.refresh())
+    providers.onDidChangeStatus(() => provider.refresh())
   );
 
   context.subscriptions.push(
@@ -338,17 +571,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push({
     dispose: () => {
       void orchestrator.dispose();
+      management.dispose();
     },
   });
 
-  // Detect the runtime without blocking activation; the panel shows "Detecting…"
-  // until it resolves.
-  void runtime.detect().then((status) => {
+  // Probe the local runtime without blocking activation; the panel shows
+  // "Detecting…" until it resolves.
+  //
+  // Only the CLI is probed here. A remote provider's check is an HTTP request,
+  // and PairPilot does not put one on the wire until the developer opens the
+  // management view or asks for a test — activation is not consent to that.
+  void (async () => {
+    if (providers.activeProviderId !== 'claude-code') {
+      return;
+    }
+    const status = await providers.active().detect();
     if (!status.available) {
       logger.warn(status.message);
     }
     provider.refresh();
-  });
+  })();
 
   if (!workspace) {
     logger.warn(

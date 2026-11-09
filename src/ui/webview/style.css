@@ -169,6 +169,43 @@ pre,
   color: var(--vscode-badge-foreground);
 }
 
+/* ---------------------------------------------------------- mode bar ----- */
+
+.mode-bar {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  font-size: 0.85em;
+}
+
+.mode-label {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 0.85em;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+
+/* Planning and coding read differently on purpose: the developer should be able
+   to tell at a glance whether the next instruction can touch a file. */
+.mode-bar.planning .mode-label {
+  background: var(--vscode-inputValidation-infoBackground, rgba(0, 122, 204, 0.2));
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-inputValidation-infoBorder, transparent);
+}
+
+.mode-summary {
+  color: var(--vscode-descriptionForeground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------------ tabs -- */
 
 .tabs {
@@ -501,6 +538,32 @@ pre.code {
 .approval-gate h3 {
   margin: 0 0 6px 0;
   font-size: 0.95em;
+}
+
+/* The file plan of a multi-file proposal: what will be written, and where the
+   turn has reached in it. Colours come from the theme, as everywhere else. */
+.change-plan {
+  margin: 8px 0;
+  padding-inline-start: 18px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.change-plan li {
+  margin: 2px 0;
+}
+
+.change-plan li.current {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+.change-plan li.done {
+  text-decoration: line-through;
+  opacity: 0.7;
 }
 
 /* -------------------------------------------------------------- progress -- */

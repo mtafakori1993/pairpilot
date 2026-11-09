@@ -154,6 +154,19 @@
     el('session-label').textContent = s.sessionId
       ? `${s.messages.length} messages`
       : 'No session';
+
+    // The mode bar. `workflowMode` may be absent from a snapshot captured by an
+    // older host build, so the whole block is guarded rather than assuming the
+    // field is there — a panel that throws on a missing field shows nothing at
+    // all, which is a worse failure than a missing badge.
+    const mode = s.workflowMode;
+    if (mode) {
+      const bar = el('mode-bar');
+      el('mode-label').textContent = mode.label;
+      el('mode-summary').textContent = mode.summary;
+      bar.title = mode.reason;
+      bar.className = 'mode-bar ' + (mode.id === 'coding' ? 'coding' : 'planning');
+    }
   }
 
   function renderTabs() {
@@ -367,15 +380,68 @@
         : 'PairPilot will create this file empty, write the proposed code into your editor, and then ask you to review it. If you reject the code, the file is removed again.';
     gate.appendChild(explanation);
 
+    // A multi-file proposal repeats this gate per file, so the panel says which
+    // one this is and what is still to come. Without that, "change 3" would look
+    // like an unexplained new request.
+    const progress = changeProgress();
+    if (progress) {
+      const position = document.createElement('div');
+      position.className = 'hint';
+      position.textContent =
+        'This proposal writes ' +
+        progress.total +
+        ' files. You are being asked about file ' +
+        progress.index +
+        '. Each file is still shown for review as it is written.';
+      gate.appendChild(position);
+
+      const plan = document.createElement('ol');
+      plan.className = 'change-plan';
+      plan.setAttribute('dir', 'ltr');
+      for (let i = 0; i < snapshot.changePlan.length; i++) {
+        const entry = snapshot.changePlan[i];
+        const item = document.createElement('li');
+        // Every field is model-supplied text, so it goes in with textContent.
+        item.textContent = entry.operation + ' ' + entry.file;
+        if (i + 1 < progress.index) {
+          item.className = 'done';
+        } else if (i + 1 === progress.index) {
+          item.className = 'current';
+        }
+        plan.appendChild(item);
+      }
+      gate.appendChild(plan);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'actions';
 
     const approve = document.createElement('button');
-    approve.textContent = snapshot.pendingFileOperation === 'update' ? 'Allow update' : 'Allow creation';
+    approve.textContent =
+      progress && progress.total > 1
+        ? 'Allow this file'
+        : snapshot.pendingFileOperation === 'update'
+          ? 'Allow update'
+          : 'Allow creation';
     approve.addEventListener('click', () => {
       post({ type: 'approveFileCreation', contentHash: currentHash() });
     });
     actions.appendChild(approve);
+
+    // Approving the set is offered only when there is a set, and it approves the
+    // same object the host holds — the set hash — so the host can verify it
+    // against live state exactly as it verifies a single file.
+    if (progress && progress.total > progress.index) {
+      const remaining = progress.total - progress.index;
+      const approveAll = document.createElement('button');
+      approveAll.className = 'secondary';
+      approveAll.textContent =
+        'Allow all ' + remaining + ' remaining file' + (remaining === 1 ? '' : 's');
+      approveAll.addEventListener('click', () => {
+        post({ type: 'approveFileCreation', contentHash: progress.setId });
+      });
+      actions.appendChild(approveAll);
+    }
 
     const reject = document.createElement('button');
     reject.className = 'secondary';
@@ -387,6 +453,18 @@
 
     gate.appendChild(actions);
     return gate;
+  }
+
+  /** The change-set position, or null for a single-file proposal. */
+  function changeProgress() {
+    if (!snapshot || !snapshot.changeProgress) {
+      return null;
+    }
+    const progress = snapshot.changeProgress;
+    if (!progress.total || progress.total < 2) {
+      return null;
+    }
+    return progress;
   }
 
   /**

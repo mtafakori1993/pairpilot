@@ -16,17 +16,30 @@
  *   - a chunk ending mid-key never emits the next field's content;
  *   - commas, braces and quotes inside string values are treated as data.
  *
- * Deliberately narrow: it extracts `blocks[i].code` (for progressive writing)
- * and top-level scalars (for early UI feedback). Everything else is the
- * parser's job on the completed document — we do not build a second JSON parser.
+ * Deliberately narrow: it extracts the one string per change that carries file
+ * content (for progressive writing) and the short scalars worth showing early.
+ * Everything else is the parser's job on the completed document — we do not
+ * build a second JSON parser.
+ *
+ * ## Which shape it reads
+ *
+ * Both the canonical contract and the 0.1.x one, because the scanner runs while
+ * the document is still arriving and cannot know which the model chose:
+ *
+ *   - canonical: `changes[i].content`, with `changes[i].file` for the label
+ *   - legacy:    `blocks[i].code`,     with a root-level `filePath`
+ *
+ * The array is recognised by the key it hangs off (`changes`, `files` or
+ * `blocks`), so a nested `content` key anywhere else in the document is never
+ * mistaken for code.
  *
  * Also bounded: a malicious or runaway stream cannot grow memory without limit.
  */
 
 export interface ScannerCallbacks {
-  /** Decoded, newly-available characters of `blocks[blockIndex].code`. */
+  /** Decoded, newly-available characters of the change's content string. */
   onCodeDelta?(blockIndex: number, delta: string): void;
-  /** A top-level scalar finished (for example `filePath`). */
+  /** A short scalar finished (for example `file`, `filePath` or `type`). */
   onFieldComplete?(name: string, value: string): void;
   /** Called when the scanner sees a structural problem. Non-fatal. */
   onWarning?(message: string): void;
@@ -44,14 +57,30 @@ const DEFAULT_LIMITS: ScannerLimits = {
   maxFieldChars: 8 * 1024,
 };
 
-/** Top-level scalars worth surfacing before the document completes. */
+/** Root-level scalars worth surfacing before the document completes. */
 const INTERESTING_ROOT_FIELDS = new Set([
   'type',
   'filePath',
   'operation',
   'description',
   'rationale',
+  'message',
 ]);
+
+/** Scalars inside one change object, which is where the canonical shape puts them. */
+const INTERESTING_CHANGE_FIELDS = new Set([
+  'file',
+  'filePath',
+  'operation',
+  'description',
+  'language',
+]);
+
+/** Keys whose string value is the file's content. */
+const CODE_KEYS = new Set(['content', 'code']);
+
+/** Array keys whose elements are changes. */
+const CHANGE_ARRAY_KEYS = new Set(['changes', 'files', 'blocks']);
 
 interface Frame {
   kind: 'object' | 'array';
@@ -61,8 +90,8 @@ interface Frame {
   pendingKey: string | null;
   /** For objects: true when the next string is a key rather than a value. */
   expectKey: boolean;
-  /** True for the array that is the value of the root `blocks` key. */
-  isBlocksArray: boolean;
+  /** True for the root-level array whose elements are changes. */
+  isChangeArray: boolean;
 }
 
 /** What the string currently being read is being collected into. */
@@ -143,13 +172,16 @@ export class JsonStreamScanner {
         this.beginString();
         return;
       case '{':
-        this.pushFrame({ kind: 'object', index: 0, pendingKey: null, expectKey: true, isBlocksArray: false });
+        this.pushFrame({ kind: 'object', index: 0, pendingKey: null, expectKey: true, isChangeArray: false });
         return;
       case '[': {
         const parent = this.top();
-        const isBlocks =
-          parent?.kind === 'object' && parent.pendingKey === 'blocks' && this.frames.length === 1;
-        this.pushFrame({ kind: 'array', index: 0, pendingKey: null, expectKey: false, isBlocksArray: isBlocks });
+        const isChanges =
+          parent?.kind === 'object' &&
+          parent.pendingKey !== null &&
+          CHANGE_ARRAY_KEYS.has(parent.pendingKey) &&
+          this.frames.length === 1;
+        this.pushFrame({ kind: 'array', index: 0, pendingKey: null, expectKey: false, isChangeArray: isChanges });
         return;
       }
       case '}':
@@ -229,6 +261,10 @@ export class JsonStreamScanner {
    * Decide what the string about to be read represents, *before* its content
    * arrives. Doing this up front is what lets us stream characters immediately
    * instead of buffering the whole value and diffing afterwards.
+   *
+   * The change array is identified by its position — the second frame, hanging
+   * off a change-array key — so nested objects that happen to contain a
+   * `content` key of their own are not mistaken for file content.
    */
   private resolveStringTarget(): StringTarget {
     const frame = this.top();
@@ -240,15 +276,26 @@ export class JsonStreamScanner {
         return { kind: 'skip', isKey: true };
       }
       const key = frame.pendingKey;
+      if (key === null) {
+        return null;
+      }
       // Root-level scalar?
-      if (this.frames.length === 1 && key && INTERESTING_ROOT_FIELDS.has(key)) {
+      if (this.frames.length === 1 && INTERESTING_ROOT_FIELDS.has(key)) {
         return { kind: 'field', name: key };
       }
-      // blocks[i].code ?
-      if (key === 'code' && this.frames.length === 3) {
-        const maybeBlocks = this.frames[1];
-        if (maybeBlocks?.kind === 'array' && maybeBlocks.isBlocksArray) {
-          return { kind: 'code', blockIndex: maybeBlocks.index };
+      // Inside one element of the changes array: [root, array, changeObject].
+      if (this.frames.length === 3) {
+        const array = this.frames[1];
+        if (array?.kind !== 'array' || !array.isChangeArray) {
+          return null;
+        }
+        if (CODE_KEYS.has(key)) {
+          return { kind: 'code', blockIndex: array.index };
+        }
+        if (INTERESTING_CHANGE_FIELDS.has(key)) {
+          // Reported under the change's own index so the UI can say which file
+          // of a set is being written, rather than just "a file".
+          return { kind: 'field', name: `changes[${array.index}].${key}` };
         }
       }
       return null;

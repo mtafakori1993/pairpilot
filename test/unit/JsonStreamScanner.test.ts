@@ -252,3 +252,129 @@ describe('JsonStreamScanner: progressive delivery', () => {
     expect(deltaCount).toBeGreaterThan(20);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* The canonical multi-file shape                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Since 0.2 the model is asked for `changes[i].content` rather than
+ * `blocks[i].code`. The scanner runs while the document is arriving, so it
+ * cannot know which shape it is reading and must handle both.
+ */
+const CANONICAL_DOCUMENT = JSON.stringify({
+  protocol_version: '1.0',
+  type: 'code_proposal',
+  message: 'A user module backed by SQLite.',
+  changes: [
+    {
+      id: 'change_001',
+      file: 'src/Domain/User.php',
+      operation: 'create',
+      language: 'php',
+      description: 'The User entity.',
+      content: '<?php\n\nfinal class User {}\n',
+      dependencies: [],
+      risk: 'low',
+    },
+    {
+      id: 'change_002',
+      file: 'src/Infrastructure/UserRepository.php',
+      operation: 'create',
+      description: 'SQLite-backed repository.',
+      content: '<?php\n\nfinal class UserRepository {}\n',
+      dependencies: ['src/Domain/User.php'],
+      risk: 'medium',
+    },
+  ],
+});
+
+describe('JsonStreamScanner: the canonical changes[] shape', () => {
+  it('extracts the content of every change, keyed by its position in the reply', () => {
+    const { scanner, result } = makeScanner();
+    scanner.push(CANONICAL_DOCUMENT);
+    expect(result.code.get(0)).toBe('<?php\n\nfinal class User {}\n');
+    expect(result.code.get(1)).toBe('<?php\n\nfinal class UserRepository {}\n');
+  });
+
+  it('reports each change’s file and operation under its own index', () => {
+    const { scanner, result } = makeScanner();
+    scanner.push(CANONICAL_DOCUMENT);
+    // The Orchestrator looks these up by index so it can name the file being
+    // written instead of saying "a file".
+    expect(result.fields.get('changes[0].file')).toBe('src/Domain/User.php');
+    expect(result.fields.get('changes[1].file')).toBe('src/Infrastructure/UserRepository.php');
+    expect(result.fields.get('changes[0].operation')).toBe('create');
+  });
+
+  it('still reports the root message of the set', () => {
+    const { scanner, result } = makeScanner();
+    scanner.push(CANONICAL_DOCUMENT);
+    expect(result.fields.get('message')).toBe('A user module backed by SQLite.');
+  });
+
+  it('produces identical content at every chunk size', () => {
+    const whole = makeScanner();
+    whole.scanner.push(CANONICAL_DOCUMENT);
+
+    for (const size of [1, 2, 3, 7, 64, 1024]) {
+      const { scanner, result } = makeScanner();
+      for (let i = 0; i < CANONICAL_DOCUMENT.length; i += size) {
+        scanner.push(CANONICAL_DOCUMENT.slice(i, i + size));
+      }
+      expect(result.code.get(0), `chunk size ${size}`).toBe(whole.result.code.get(0));
+      expect(result.code.get(1), `chunk size ${size}`).toBe(whole.result.code.get(1));
+    }
+  });
+
+  it('does not mistake a nested `content` key for file content', () => {
+    const document = JSON.stringify({
+      type: 'code_proposal',
+      message: 'x',
+      metadata: { content: 'SHOULD NOT BE CAPTURED' },
+      changes: [{ file: 'a.ts', operation: 'create', description: 'd', content: 'REAL' }],
+    });
+    const { scanner, result } = makeScanner();
+    scanner.push(document);
+    expect([...result.code.values()]).toEqual(['REAL']);
+  });
+
+  it('does not treat a root `files` array as anything but changes', () => {
+    // `files` is an accepted synonym for `changes`; a `files` array of plain
+    // strings has nothing to extract and must not produce code.
+    const document = JSON.stringify({ type: 'code_proposal', message: 'x', files: ['a.ts', 'b.ts'] });
+    const { scanner, result } = makeScanner();
+    scanner.push(document);
+    expect(result.code.size).toBe(0);
+  });
+
+  it('handles a change whose content arrives in many small deltas', () => {
+    const { scanner, result } = makeScanner();
+    const deltas: number[] = [];
+    const counting = new JsonStreamScanner({
+      onCodeDelta: (_index, delta) => deltas.push(delta.length),
+    });
+    for (const character of CANONICAL_DOCUMENT) {
+      counting.push(character);
+    }
+    scanner.push(CANONICAL_DOCUMENT);
+    // Progressive delivery: real streamed characters, not one jump at the end.
+    expect(deltas.filter((length) => length > 0).length).toBeGreaterThan(20);
+    expect(result.code.get(0)).toContain('final class User');
+  });
+
+  it('keeps Persian content intact across a chunk boundary', () => {
+    const document = JSON.stringify({
+      type: 'code_proposal',
+      message: 'ثبت نام',
+      changes: [
+        { file: 'src/User.php', operation: 'create', description: 'ثبت نام', content: '<?php\n// ثبت نام کاربر\n' },
+      ],
+    });
+    const { scanner, result } = makeScanner();
+    for (const character of document) {
+      scanner.push(character);
+    }
+    expect(result.code.get(0)).toBe('<?php\n// ثبت نام کاربر\n');
+  });
+});

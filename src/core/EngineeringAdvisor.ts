@@ -19,7 +19,7 @@
  */
 
 import * as path from 'node:path';
-import { extractBalancedObjects } from '../proposals/ProposalParser';
+import { extractBalancedObjects } from '../protocol/parse';
 import type { AdvisorRecommendation } from '../types';
 
 /** What the advisor needs to reason about a finished file. */

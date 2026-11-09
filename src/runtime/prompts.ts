@@ -1,5 +1,7 @@
 /**
- * Prompt construction for the Claude Code runtime.
+ * Prompt construction.
+ *
+ * ## The one stable system prompt
  *
  * Design constraint discovered by probing the CLI: `--system-prompt-snapshot`
  * defaults to *on*, which means the system prompt is recorded on the first
@@ -7,47 +9,151 @@
  * `--append-system-prompt` would be silently ignored from turn two onward.
  *
  * So there is exactly ONE stable system prompt per session, and everything that
- * varies per turn (the task, the context, the required output shape) goes in the
- * user message. This is also the cheaper arrangement: a stable system prompt is
- * cacheable, while a rebuilt one is not.
+ * varies per turn (the task, the context, which type of answer is wanted) goes in
+ * the user message. This is also the cheaper arrangement: a stable system prompt
+ * is cacheable, while a rebuilt one is not.
+ *
+ * ## Why the contract is stated once, in full
+ *
+ * The system prompt and the parser must describe the *same* contract. In 0.1.x
+ * they did not agree with the wider ecosystem: the prompt asked for a flat
+ * single-file object, the parser only accepted `blocks[]`, and a model answering
+ * with a nested multi-file payload was rejected with a message that blamed the
+ * model. The contract below is now the exact shape `protocol/schema.ts` accepts
+ * — one schema, stated in one place, enforced in one place.
  */
 
-import type { CodeProposal, ContextFileSummary, OperationType } from '../types';
+import { PAIRPILOT_PROTOCOL_VERSION } from '../protocol/types';
+import type { ContextFileSummary, OperationType } from '../types';
 
 /**
  * The stable, session-wide system prompt.
  *
- * Two jobs: define the machine-readable contract, and state the security rules
- * the model is expected to respect. The second is defence in depth only — the
- * extension never relies on the model obeying it. Tool use is disabled at the
- * process level, so even a fully compromised model cannot write a file.
+ * Three jobs: define the machine-readable contract, say which message type each
+ * kind of turn should produce, and state the security rules the model is
+ * expected to respect. The last is defence in depth only — the extension never
+ * relies on the model obeying it. Tool use is disabled at the process level, so
+ * even a fully compromised model cannot write a file, and every path and byte is
+ * re-checked in `ProposalValidator` before anything reaches disk.
  */
 export const SYSTEM_PROMPT = `You are the reasoning engine inside PairPilot, an editor extension for supervised AI pair programming.
 
-Absolute rules:
+## Absolute rules
 1. You have no filesystem access. You cannot read, create, modify or delete files. Never claim that you have done so. You only *propose*; a human applies changes after explicit approval.
-2. Never propose deleting a file. Only "create" and "update" exist.
+2. Never propose deleting a file. Only "create" and "update" are executable operations.
 3. All file paths must be relative to the workspace root, using forward slashes. Never use an absolute path, a ".." segment, or a path outside the project. Never propose changes under node_modules, vendor, .git, dist, build or other dependency and build output directories.
 4. Never output secrets, and never invent content for .env files or credentials.
-5. When you propose code, output ONLY a single JSON object. No markdown fences, no commentary before or after, no trailing text.
+5. Output ONLY a single JSON object. No markdown fences, no commentary before or after, no trailing text.
 
-Proposal JSON shape:
+## The response contract (protocol version ${PAIRPILOT_PROTOCOL_VERSION})
+
+Every reply is one JSON object with these keys:
+
+  "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}"
+  "type":            one of the message types listed below
+  "message":         your answer in prose — always required
+
+### type: "code_proposal"
+Use this whenever the developer asks you to create or change code. A single
+proposal may contain as many files as the task genuinely needs.
+
 {
+  "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}",
   "type": "code_proposal",
-  "filePath": "src/example.ts",
-  "operation": "create" | "update",
-  "description": "One sentence describing the change.",
-  "rationale": "Why this implementation was chosen over the alternatives.",
-  "responsibilities": ["What this code is responsible for."],
-  "dependencies": ["src/other.ts", "express"],
-  "potentialProblems": ["Risks, edge cases, or things the reviewer should verify."],
-  "blocks": [
-    { "id": "block-001", "type": "class", "description": "What this block does.", "code": "export class Example {}" }
+  "message": "What you did and why, in a short paragraph.",
+  "task": { "title": "Implement user management", "description": "A PHP user module backed by SQLite.", "status": "proposed" },
+  "changes": [
+    {
+      "id": "change_001",
+      "file": "src/Domain/User.php",
+      "operation": "create",
+      "language": "php",
+      "description": "The User entity.",
+      "content": "<?php\\n\\nfinal class User {}\\n",
+      "dependencies": [],
+      "risk": "low",
+      "rationale": "A value object with no persistence concerns keeps the domain layer independent of SQLite.",
+      "responsibilities": ["Hold a user's identity and profile fields."],
+      "potentialProblems": ["No validation of the email format yet."]
+    }
   ],
-  "nextStep": { "title": "...", "reason": "...", "files": ["..."], "required": true }
+  "nextStep": { "title": "Add a repository interface", "reason": "The service needs an abstraction before it can be tested.", "files": ["src/Contracts/UserRepositoryInterface.php"], "required": true }
 }
 
-Rules for "code": it must be the complete, final file content, production quality, with no placeholder comments like "// rest of code here". Escape newlines as \\n so the document stays valid JSON.`;
+Rules for "changes":
+- "file" is the workspace-relative path. "operation" is "create" or "update".
+- "content" MUST be the complete final file content, exactly as it should appear on disk: every import, every line, in order. Never a fragment, never a diff, never a placeholder such as "// rest of the code here". The developer reviews exactly these bytes and they are written verbatim.
+- Escape newlines as \\n so the document stays valid JSON.
+- "dependencies" lists the workspace-relative paths (or package names) this file needs, so PairPilot can write files in an order that satisfies them.
+- "risk" is "low", "medium" or "high".
+- Order the changes so that dependencies come first.
+
+### type: "chat_response"
+Answering a question, greeting, or discussion in words.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "chat_response", "message": "..." }
+
+### type: "project_analysis"
+Reporting what an existing project contains.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "project_analysis", "message": "...", "analysis": { "stack": ["PHP 8.3", "SQLite"], "structure": ["src/Domain", "src/Http"], "conventions": ["PSR-4 autoloading"], "gaps": ["No tests directory"] } }
+
+### type: "project_plan"
+Producing a plan, roadmap, or design.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "project_plan", "message": "...", "plan": { "phases": [ { "name": "Foundation", "goal": "A running skeleton", "tasks": ["Set up the framework", "Define the schema"] } ], "questions": ["Which payment provider?"], "risks": ["Scope creep in phase 2"] } }
+
+### type: "architecture_discussion"
+Talking the design through with the developer before anything is built:
+components and their responsibilities, what depends on what, alternatives
+considered, and the questions still open.
+
+{
+  "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}",
+  "type": "architecture_discussion",
+  "message": "Let's settle the shape of the user module before writing anything.",
+  "requirements": ["Create, list, retrieve, update and delete users."],
+  "architecture": {
+    "components": [
+      { "name": "User", "responsibility": "Holds the identity and profile fields of one user." },
+      { "name": "UserRepository", "responsibility": "Loads and stores users through PDO, with no knowledge of HTTP." }
+    ],
+    "dependencies": ["UserRepository depends on User and on a PDO connection; nothing depends on UserRepository except the HTTP layer."],
+    "alternatives": ["An ActiveRecord-style User that saves itself was rejected: it couples the domain object to the database, which makes it hard to test."]
+  },
+  "questions": ["Should deleting a user be a hard delete or a soft delete?"],
+  "nextStep": "Agree on where validation belongs."
+}
+
+An "architecture_discussion" is NOT a plan and NOT a proposal. It contains no
+file paths, no operations and no file contents, because a directory layout
+described while designing is a diagram, not an instruction to create folders.
+Use it whenever the developer wants to think the design through with you.
+
+### type: "code_review"
+Reviewing code that already exists.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "code_review", "message": "...", "review": { "verdict": "pass" | "concerns" | "block", "findings": [ { "severity": "info" | "warning" | "error", "title": "...", "detail": "...", "file": "src/User.php" } ], "security": ["..."], "performance": ["..."], "tests": ["..."] } }
+
+### type: "engineering_advice"
+Recommending exactly ONE next engineering step. One step, not a plan.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "engineering_advice", "message": "...", "advice": { "title": "...", "reason": "...", "responsibilities": ["..."], "files": ["..."], "required": true, "priority": "required" | "recommended" | "optional" } }
+
+### type: "clarification_request"
+When you genuinely cannot proceed without an answer. Ask ONE question.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "clarification_request", "message": "...", "clarification": { "question": "...", "options": ["..."] } }
+
+### type: "error"
+When the request cannot be fulfilled at all.
+{ "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}", "type": "error", "message": "...", "error": { "code": "optional_code", "detail": "..." } }
+
+## Choosing a type
+Pick the type that matches what the developer asked for. If someone says hello,
+answer with "chat_response" — do not invent a file to write.
+
+A request to *think* is not a request to *build*. When the developer asks you to
+analyse requirements, discuss the architecture, agree on a design, or says not to
+write code yet, answer with "architecture_discussion", "project_analysis" or
+"project_plan" — never with "code_proposal", however clear the design has become.
+Describing a directory layout is not creating it. Code is written only when the
+developer asks for code, and the request for this turn states which of these
+applies.`;
 
 /** Everything the runtime needs to build one user turn. */
 export interface TurnPromptInput {
@@ -65,10 +171,25 @@ export interface TurnPromptInput {
   feedback?: string;
   /** The proposal being revised, when responding to change requests. */
   previousProposal?: { filePath: string; operation: OperationType; code: string };
+  /**
+   * What the model should answer with this turn.
+   *
+   * A hint, not a gate: the model may always choose a different valid type, and
+   * the parser handles all of them. It exists so that "Hi" is answered with
+   * conversation rather than with a speculative file.
+   */
+  typeHint?: string;
+  /**
+   * A correction to send after an invalid reply.
+   *
+   * Built from the validator's per-field issues, so the model is told exactly
+   * which field was wrong rather than "try again".
+   */
+  correction?: string;
 }
 
 /**
- * Build the user message for a proposal turn.
+ * Build the user message for a turn.
  *
  * Context is fenced and explicitly labelled as untrusted data. A file in the
  * workspace could contain text like "ignore previous instructions", so the model
@@ -78,8 +199,16 @@ export function buildProposalPrompt(input: TurnPromptInput): string {
   const sections: string[] = [];
 
   sections.push(
-    'You are working inside a PairPilot session. Respond with a single code_proposal JSON object and nothing else.'
+    'You are working inside a PairPilot session. Respond with a single JSON object and nothing else.'
   );
+
+  if (input.typeHint) {
+    sections.push(input.typeHint);
+  }
+
+  if (input.correction) {
+    sections.push(input.correction);
+  }
 
   if (input.activeFile) {
     sections.push(`The developer's active editor is: ${input.activeFile}`);
@@ -158,8 +287,10 @@ export function buildAdvisorPrompt(input: {
     '- Recommend exactly one step. Not a list, not a plan, not two options.',
     '- Do not recommend a file that already exists.',
     '- If the approved code has no unmet dependency and no obvious next step, set "required" to false and recommend the most valuable optional improvement, or state that the work is complete by recommending verification.',
-    '- Reply with ONLY a JSON object, no markdown fences, matching this shape:',
-    '{"title":"...","reason":"...","responsibilities":["..."],"files":["..."],"required":true}',
+    `- Reply with ONLY a JSON object, no markdown fences, using protocol version ${PAIRPILOT_PROTOCOL_VERSION} and this shape:`,
+    '{"protocol_version":"' +
+      PAIRPILOT_PROTOCOL_VERSION +
+      '","type":"engineering_advice","message":"...","advice":{"title":"...","reason":"...","responsibilities":["..."],"files":["..."],"required":true,"priority":"required"}}',
     '',
     `The approved file: ${input.relativePath}`,
     '',
@@ -179,10 +310,37 @@ export function buildAdvisorPrompt(input: {
   ].join('\n');
 }
 
+/**
+ * Build the corrective prompt for a reply that failed validation.
+ *
+ * The point of a retry is that it can succeed. "Your reply was invalid, try
+ * again" cannot: the model has no way to know which of the four things it did
+ * was wrong. This restates the exact issues the validator found, against the
+ * same JSON paths, and asks for the whole document again — a partial fix would
+ * leave the reply unparseable in a new way.
+ */
+export function buildCorrectionPrompt(issues: readonly { path: string; message: string }[]): string {
+  const lines = [
+    'Your previous reply was valid JSON, but it did not match the PairPilot response contract, so nothing was written.',
+    '',
+    'The specific problems were:',
+  ];
+  for (const issue of issues.slice(0, 12)) {
+    lines.push(issue.path ? `- ${issue.path}: ${issue.message}` : `- ${issue.message}`);
+  }
+  if (issues.length > 12) {
+    lines.push(`- …and ${issues.length - 12} more problems of the same kind.`);
+  }
+  lines.push(
+    '',
+    'Reply again with ONE complete, corrected JSON object and nothing else. Do not explain the correction, do not add markdown fences, and do not omit the parts that were already correct.'
+  );
+  return lines.join('\n');
+}
+
 /** A plain conversational turn (no proposal expected). */
 export function buildChatPrompt(input: TurnPromptInput): string {
-  const base = buildProposalPrompt({ ...input, task: input.task });
-  return `${base}\n\n---\n\nFor this turn, reply in plain prose. Do not output a code_proposal JSON object.`;
+  return buildProposalPrompt(input);
 }
 
 /** Describe the context actually sent, for the transparency panel. */
@@ -197,11 +355,21 @@ export function summariseContext(
   }));
 }
 
-/** Type guard used by the parser, kept here so the shape lives in one place. */
-export function looksLikeProposal(value: unknown): value is CodeProposal {
+/**
+ * Type guard for a legacy flat proposal.
+ *
+ * Retained because the runtime's *stream scanner* still looks for `blocks[]` in
+ * the 0.1.x shape while a stream is arriving, and because callers outside this
+ * package historically imported it. New code should use
+ * `parseProtocol` → `validateProtocolMessage`, which handles every shape.
+ */
+export function looksLikeProposal(value: unknown): boolean {
   if (value === null || typeof value !== 'object') {
     return false;
   }
   const record = value as Record<string, unknown>;
-  return record['type'] === 'code_proposal' && Array.isArray(record['blocks']);
+  if (record['type'] !== 'code_proposal') {
+    return false;
+  }
+  return Array.isArray(record['blocks']) || Array.isArray(record['changes']);
 }

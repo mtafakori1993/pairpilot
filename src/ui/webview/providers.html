@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<!--
+  The CSP is the security boundary for this panel.
+
+  `default-src 'none'` denies everything that is not named. Scripts and styles
+  are allowed only from this extension's own media folder and only with the
+  nonce generated for this load, so neither inline script nor remote script can
+  run. `connect-src 'none'` is what stops the panel from making its own network
+  request: a model catalogue is fetched by the extension host, never here.
+-->
+<meta
+  http-equiv="Content-Security-Policy"
+  content="default-src 'none'; img-src {{cspSource}} data:; style-src {{cspSource}} 'nonce-{{nonce}}'; script-src 'nonce-{{nonce}}'; connect-src 'none'; form-action 'none'; base-uri 'none';"
+/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Providers &amp; Models</title>
+<!-- shared.css first: it carries the base rules both panels use. -->
+<link href="{{sharedStyleUri}}" rel="stylesheet" nonce="{{nonce}}" />
+<link href="{{styleUri}}" rel="stylesheet" nonce="{{nonce}}" />
+</head>
+<body>
+  <div id="root" class="pp-root" aria-busy="true">
+    <p class="pp-loading">Loading providers…</p>
+  </div>
+  <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+</body>
+</html>

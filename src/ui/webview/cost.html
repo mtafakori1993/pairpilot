@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<!--
+  Same boundary as the providers panel: nothing but this extension's own script
+  and stylesheet runs, `connect-src 'none'` means the panel cannot reach the
+  network, and there is no inline script to allow.
+-->
+<meta
+  http-equiv="Content-Security-Policy"
+  content="default-src 'none'; img-src {{cspSource}} data:; style-src {{cspSource}} 'nonce-{{nonce}}'; script-src 'nonce-{{nonce}}'; connect-src 'none'; form-action 'none'; base-uri 'none';"
+/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cost &amp; Usage</title>
+<!-- shared.css first: it carries the base rules both panels use. -->
+<link href="{{sharedStyleUri}}" rel="stylesheet" nonce="{{nonce}}" />
+<link href="{{styleUri}}" rel="stylesheet" nonce="{{nonce}}" />
+</head>
+<body>
+  <div id="root" class="pp-root" aria-busy="true">
+    <p class="pp-loading">Loading usage…</p>
+  </div>
+  <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+</body>
+</html>

@@ -2,7 +2,7 @@
   "name": "pairpilot",
   "displayName": "PairPilot",
   "description": "Human-controlled AI pair programming. The AI proposes, you review and approve, then PairPilot writes the code in your real editor.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "mtafakori1993",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -33,7 +33,16 @@
     }
   },
   "activationEvents": [
-    "onView:pairpilot.sidebarView"
+    "onView:pairpilot.sidebarView",
+    "onView:pairpilot.providersView",
+    "onView:pairpilot.costView",
+    "onCommand:pairpilot.setApiKey",
+    "onCommand:pairpilot.testConnection",
+    "onCommand:pairpilot.disconnectProvider",
+    "onCommand:pairpilot.refreshModelCatalog",
+    "onCommand:pairpilot.clearUsageHistory",
+    "onCommand:pairpilot.openProviderSettings",
+    "onCommand:pairpilot.openKeyPage"
   ],
   "contributes": {
     "viewsContainers": {
@@ -53,6 +62,22 @@
           "name": "PairPilot",
           "icon": "media/pairpilot.svg",
           "contextualTitle": "PairPilot"
+        },
+        {
+          "type": "webview",
+          "id": "pairpilot.providersView",
+          "name": "AI Providers & Models",
+          "icon": "media/pairpilot.svg",
+          "contextualTitle": "AI Providers & Models",
+          "visibility": "collapsed"
+        },
+        {
+          "type": "webview",
+          "id": "pairpilot.costView",
+          "name": "Cost & Usage",
+          "icon": "media/pairpilot.svg",
+          "contextualTitle": "Cost & Usage",
+          "visibility": "collapsed"
         }
       ]
     },
@@ -93,6 +118,51 @@
         "command": "pairpilot.checkRuntime",
         "title": "PairPilot: Check AI Runtime",
         "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.showProviders",
+        "title": "PairPilot: Show AI Providers & Models",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.showCosts",
+        "title": "PairPilot: Show Cost & Usage",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.setApiKey",
+        "title": "PairPilot: Set or Replace Provider API Key…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.testConnection",
+        "title": "PairPilot: Test Provider Connection",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.disconnectProvider",
+        "title": "PairPilot: Disconnect Provider and Delete Stored Key…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.refreshModelCatalog",
+        "title": "PairPilot: Refresh Model Catalog",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.clearUsageHistory",
+        "title": "PairPilot: Clear Usage History…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.openProviderSettings",
+        "title": "PairPilot: Open Provider Settings",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.openKeyPage",
+        "title": "PairPilot: Open OpenRouter Key Page",
+        "category": "PairPilot"
       }
     ],
     "menus": {
@@ -106,6 +176,21 @@
           "command": "pairpilot.cancel",
           "when": "view == pairpilot.sidebarView",
           "group": "navigation@2"
+        },
+        {
+          "command": "pairpilot.refreshModelCatalog",
+          "when": "view == pairpilot.providersView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "pairpilot.openProviderSettings",
+          "when": "view == pairpilot.providersView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "pairpilot.clearUsageHistory",
+          "when": "view == pairpilot.costView",
+          "group": "navigation@1"
         }
       ]
     },
@@ -193,6 +278,54 @@
           "minimum": 1,
           "maximum": 500,
           "description": "Maximum number of sessions kept in local workspace storage."
+        },
+        "pairpilot.providers.activeProvider": {
+          "type": "string",
+          "enum": [
+            "claude-code",
+            "openrouter"
+          ],
+          "enumDescriptions": [
+            "Use the locally installed Claude Code CLI. No API key is stored by PairPilot and no request leaves your machine beyond the CLI's own.",
+            "Use a remote OpenAI-compatible provider. Requires an API key, which is kept in VS Code's encrypted secret storage."
+          ],
+          "default": "claude-code",
+          "markdownDescription": "Which AI backend serves PairPilot's requests. PairPilot ships with the local Claude Code CLI enabled by default; switching to a remote provider is a deliberate choice and PairPilot will not make it for you."
+        },
+        "pairpilot.providers.openrouter.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer OpenRouter as a selectable provider in the \"AI Providers & Models\" view. Switching it off refuses turns that would go to OpenRouter and marks the provider card as switched off; the card stays listed, a stored key is kept rather than deleted, and the model catalogue keeps refreshing because it is a public endpoint that needs no key."
+        },
+        "pairpilot.providers.openrouter.baseUrl": {
+          "type": "string",
+          "default": "https://openrouter.ai/api/v1",
+          "markdownDescription": "Base URL for the OpenRouter API. Change this only to point at a compatible gateway you control; the API key stored for this provider is sent to whatever host is configured here."
+        },
+        "pairpilot.providers.openrouter.maxOutputTokens": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Cap on output tokens per request. `0` sends no cap and lets the model's own default apply. A model that spends its whole output budget on reasoning returns no text at all, so a cap that is too low can look like an empty reply."
+        },
+        "pairpilot.providers.catalogRefreshHours": {
+          "type": "number",
+          "default": 12,
+          "minimum": 0,
+          "markdownDescription": "How long a fetched model catalogue is considered fresh, in hours. The catalogue is refreshed when the management view opens and the cached copy is older than this. `0` turns automatic refreshing off: the catalogue is then fetched only when you run \"PairPilot: Refresh Model Catalog\"."
+        },
+        "pairpilot.cost.budgetUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Advisory spend warning, in US dollars, per session. When a session's recorded cost passes this figure PairPilot shows a warning once. `0` disables the warning. **PairPilot never blocks a request on cost**, whatever this is set to."
+        },
+        "pairpilot.cost.historyLimit": {
+          "type": "number",
+          "default": 500,
+          "minimum": 50,
+          "maximum": 5000,
+          "description": "Maximum number of usage records kept in local storage. The oldest records are discarded first."
         }
       }
     }

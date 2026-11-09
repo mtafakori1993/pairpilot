@@ -5,6 +5,8 @@
  * other module — including pure-unit tests — can depend on it.
  */
 
+import type { CodeProposalMessage, ProposalChange } from '../protocol/types';
+
 /* -------------------------------------------------------------------------- */
 /* State machine                                                              */
 /* -------------------------------------------------------------------------- */
@@ -64,6 +66,11 @@ export const STATE_TRANSITIONS: Readonly<Record<PairPilotState, readonly PairPil
   ],
   [PairPilotState.PROPOSING]: [
     PairPilotState.WAITING_FILE_APPROVAL,
+    // A reply that carried words and no change ends the turn here. Without this
+    // edge a conversational answer left the machine parked in PROPOSING — busy,
+    // so the composer stayed locked and the developer could not ask anything
+    // else. Answering is a completion, not a rejection.
+    PairPilotState.COMPLETED,
     PairPilotState.REJECTED,
     PairPilotState.FAILED,
     PairPilotState.CANCELLED,
@@ -100,6 +107,11 @@ export const STATE_TRANSITIONS: Readonly<Record<PairPilotState, readonly PairPil
   [PairPilotState.APPROVED]: [
     PairPilotState.ANALYZING_NEXT_STEP,
     PairPilotState.COMPLETED,
+    // A multi-file proposal is applied one file at a time. Approving the code of
+    // one file therefore leads straight back to the *file* permission gate for
+    // the next, which is the only transition that makes a change set possible
+    // without inventing a second approval mechanism alongside the first.
+    PairPilotState.WAITING_FILE_APPROVAL,
   ],
   [PairPilotState.REQUESTING_CHANGES]: [
     PairPilotState.ANALYZING,
@@ -197,6 +209,60 @@ export interface ValidatedProposal {
 export type ApprovalDecision = 'approve' | 'reject' | 'request_changes';
 
 /* -------------------------------------------------------------------------- */
+/* Multi-file change sets                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One validated file change.
+ *
+ * The same guarantees as `ValidatedProposal` — a path inside the workspace, a
+ * hash binding the approval to the exact bytes — but for a single member of a
+ * multi-file proposal. `ValidatedProposal` remains the per-file shape the
+ * writer, the approval manager and the review panel consume; this is the shape
+ * the *set* is validated into.
+ */
+export interface ValidatedChange {
+  /** The canonical change, with its `file` normalised to the relative path. */
+  change: ProposalChange;
+  /** Workspace-relative, POSIX-separated path. */
+  relativePath: string;
+  /** Absolute path, verified to resolve inside the workspace root. */
+  absolutePath: string;
+  /** SHA-256 over operation, path and content — the approval binding. */
+  contentHash: string;
+  /** Content ready to write, with exactly one trailing newline. */
+  assembledCode: string;
+  /** Non-fatal issues found while validating this change. */
+  warnings: string[];
+  /**
+   * The change's position in the message as the AI sent it.
+   *
+   * Validation may reorder changes into dependency order, and the stream
+   * scanner indexes live code by the *sent* position. Keeping both lets the
+   * writer replay the real streamed characters for a change it has moved.
+   */
+  sourceIndex: number;
+}
+
+/**
+ * A validated proposal, in dependency order.
+ *
+ * `changes` is already sorted so that a file is written after everything it
+ * declares a dependency on; the model's own order is preserved among
+ * independent changes.
+ */
+export interface ValidatedChangeSet {
+  /** The canonical message the set came from. */
+  envelope: CodeProposalMessage;
+  /** Changes in execution order. */
+  changes: ValidatedChange[];
+  /** Non-fatal issues found across the set. */
+  warnings: string[];
+  /** Hash over the ordered per-file hashes, for a group approval. */
+  changeSetHash: string;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Runtime                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -223,6 +289,13 @@ export interface TokenUsage {
   /** False when the runtime supplied no usage data at all. */
   available: boolean;
   model?: string;
+  /**
+   * Reasoning tokens, when the provider separates them.
+   *
+   * Carried for the cost record: on a reasoning model these are billed as
+   * output, and a cost table that omitted them would understate the total.
+   */
+  reasoningTokens?: number;
 }
 
 export function emptyUsage(): TokenUsage {
@@ -275,7 +348,88 @@ export interface TurnResult {
   errorMessage?: string;
   /** True when the turn was ended by `cancel()`. */
   cancelled: boolean;
+  /**
+   * The provider's own identifier for this generation, when it issues one.
+   *
+   * Stored on the usage record so a figure in the cost dashboard can be checked
+   * against the provider's own reporting of the same request.
+   */
+  generationId?: string;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Providers                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The provider contract lives in its own module to keep this file readable, and
+ * is re-exported here so that every existing `from '../types'` import keeps
+ * working unchanged — including the ones that predate the abstraction.
+ */
+export type {
+  AIProvider,
+  AIProviderStatus,
+  AITurnHandle,
+  AITurnRequest,
+  ProviderId,
+} from './provider';
+
+/* -------------------------------------------------------------------------- */
+/* Models, providers and cost                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * As with the provider contract above, these live in their own modules and are
+ * re-exported here so that consumers have exactly one import site.
+ */export type {
+  ModelCapabilities,
+  ModelCatalog,
+  ModelInputModality,
+  ModelMetadata,
+  ModelOutputModality,
+  ModelPricing,
+  ModelQuery,
+  ModelQuickFilter,
+  ModelSortKey,
+} from './model';
+export {
+  MODEL_INPUT_MODALITIES,
+  MODEL_OUTPUT_MODALITIES,
+  MODEL_QUICK_FILTERS,
+  MODEL_SORT_KEYS,
+  emptyCapabilities,
+  emptyPricing,
+} from './model';
+
+export type {
+  AccountInfo,
+  AuthState,
+  CatalogState,
+  ConnectionState,
+  ModelAdvice,
+  ModelAdviceReason,
+  ModelRecommendation,
+  ModelRoleDescriptor,
+  ModelSelection,
+  ModelTaskId,
+  ProviderView,
+  ResolvedModel,
+  SelectionLevel,
+} from './providerConfig';
+export { MODEL_ROLES, MODEL_TASK_IDS } from './providerConfig';
+
+export type {
+  BudgetState,
+  CostBreakdown,
+  CostSnapshot,
+  CostSource,
+  PricingSnapshot,
+  UsageDayBucket,
+  UsageGroup,
+  UsageRecord,
+  UsageTotals,
+} from './usage';
+export { emptyTotals, unavailableCost } from './usage';
 
 /* -------------------------------------------------------------------------- */
 /* Sessions                                                                   */
@@ -394,6 +548,24 @@ export interface WebviewStateSnapshot {
   pendingFileOperation: OperationType | null;
   /** Set while a proposal is written and awaiting a code decision. */
   activeProposal: ProposalRecord | null;
+  /**
+   * How far through a multi-file set the turn is, or null for a single file.
+   *
+   * The panel needs this to say "change 2 of 5" and to offer approving the whole
+   * set at once, which is only meaningful when there is more than one.
+   */
+  changeProgress: { index: number; total: number; setId: string } | null;
+  /** Every file the proposal intends to write, in the order it will write them. */
+  changePlan: { file: string; operation: string; description: string; risk: string }[];
+  /**
+   * Which kind of work the session is doing, and why.
+   *
+   * Owned by the extension host and sent down like any other state, never held
+   * in the Webview: a panel that decided its own mode could offer an approval
+   * button for work the host would refuse, and the mode is precisely the thing
+   * that must not be negotiable from the UI.
+   */
+  workflowMode: { id: string; label: string; summary: string; reason: string };
   usage: TokenUsage;
   /** Explicit context the developer pinned for the next request. */
   pinnedContext: string[];
@@ -429,6 +601,55 @@ export type HostMessage =
   | { type: 'codeDelta'; blockIndex: number; text: string }
   | { type: 'writingProgress'; written: number; total: number; relativePath: string }
   | { type: 'toast'; level: 'info' | 'warn' | 'error'; message: string };
+
+/* -------------------------------------------------------------------------- */
+/* Response protocol                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The canonical AI response contract lives in `src/protocol/`, and is
+ * re-exported here so that the domain layer has one import site for types.
+ *
+ * Only types and constants are re-exported: the runtime pieces (`parseProtocol`,
+ * `validateProtocolMessage`) stay in `src/protocol/`, so this module keeps its
+ * "no side effects, no logic" character.
+ */
+export type {
+  AdaptationKind,
+  ChangeOperation,
+  ChangeRisk,
+  ChatResponseMessage,
+  ClarificationRequestMessage,
+  CodeProposalMessage,
+  CodeReviewMessage,
+  EngineeringAdviceMessage,
+  ErrorMessage,
+  ExecutableOperation,
+  ProposalChange,
+  ProposalNextStep,
+  ProposalSummary,
+  ProposalTask,
+  ProtocolEnvelopeBase,
+  ProtocolIssue,
+  ProtocolIssueCode,
+  ProtocolMessage,
+  ProtocolMessageType,
+  ProjectAnalysisMessage,
+  ProjectPlanMessage,
+  ReservedOperation,
+  TaskStatus,
+  TaskUpdateMessage,
+} from '../protocol/types';
+export {
+  ALL_OPERATIONS,
+  CHANGE_RISKS,
+  EXECUTABLE_OPERATIONS,
+  PAIRPILOT_PROTOCOL_VERSION,
+  PROTOCOL_MESSAGE_TYPES,
+  RESERVED_OPERATIONS,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  TASK_STATUSES,
+} from '../protocol/types';
 
 /* -------------------------------------------------------------------------- */
 /* Misc                                                                       */

@@ -11,11 +11,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ApprovalManager, toProposalRecord } from '../../src/proposals/ApprovalManager';
-import { ProposalValidator } from '../../src/proposals/ProposalValidator';
+import { ProposalValidator, toValidatedProposal } from '../../src/proposals/ProposalValidator';
 import { MessageValidator } from '../../src/security/MessageValidator';
 import { PathGuard } from '../../src/security/PathGuard';
 import { ApprovalMismatchError, MessageRejectedError } from '../../src/core/errors';
-import type { CodeProposal, ValidatedProposal } from '../../src/types';
+import { PAIRPILOT_PROTOCOL_VERSION } from '../../src/protocol/types';
+import type { CodeProposalMessage } from '../../src/protocol/types';
+import type { ValidatedProposal } from '../../src/types';
 
 let root: string;
 let validator: ProposalValidator;
@@ -31,15 +33,25 @@ afterEach(() => {
 });
 
 function makeProposal(filePath = 'src/a.ts', code = 'export const a = 1;\n'): ValidatedProposal {
-  const proposal: CodeProposal = {
+  const message: CodeProposalMessage = {
+    protocol_version: PAIRPILOT_PROTOCOL_VERSION,
     type: 'code_proposal',
-    filePath,
-    operation: 'create',
-    description: 'Create a',
-    dependencies: [],
-    blocks: [{ id: 'b1', type: 'code', description: '', code }],
+    message: 'Create a',
+    changes: [
+      {
+        id: 'change_001',
+        file: filePath,
+        operation: 'create',
+        description: 'Create a',
+        content: code,
+        dependencies: [],
+        risk: 'low',
+      },
+    ],
+    summary: { files_to_create: 1, files_to_update: 0, files_to_delete: 0 },
   };
-  return validator.validate(proposal);
+  const set = validator.validateChangeSet(message);
+  return toValidatedProposal(set.changes[0]!, set.envelope);
 }
 
 describe('ApprovalManager: hash binding', () => {
@@ -172,9 +184,14 @@ describe('toProposalRecord', () => {
   });
 
   it('omits absent optional fields rather than setting them undefined', () => {
+    // `rationale` is *not* absent here: a change with no rationale of its own
+    // inherits the proposal's own explanation, which is the model's account of
+    // why the change set exists. The fields that really are absent must not be
+    // written as `undefined`, because the panel tests for their presence.
     const record = toProposalRecord(makeProposal());
-    expect('rationale' in record).toBe(false);
+    expect(record.rationale).toBe('Create a');
     expect('potentialProblems' in record).toBe(false);
+    expect('responsibilities' in record).toBe(false);
   });
 });
 

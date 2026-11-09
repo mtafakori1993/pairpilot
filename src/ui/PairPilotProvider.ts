@@ -21,11 +21,11 @@ import * as vscode from 'vscode';
 import { toProposalRecord } from '../proposals/ApprovalManager';
 import type { Orchestrator } from '../core/Orchestrator';
 import type { SessionStore } from '../storage/SessionStore';
-import type { ClaudeCodeRuntime } from '../runtime/ClaudeCodeRuntime';
 import type { WorkspaceContext } from '../context/WorkspaceContext';
 import {
   PairPilotState,
   type HostMessage,
+  type RuntimeStatus,
   type WebviewStateSnapshot,
 } from '../types';
 
@@ -39,7 +39,15 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
     private readonly deps: {
       orchestrator: Orchestrator;
       store: SessionStore;
-      runtime: ClaudeCodeRuntime;
+      /**
+       * The active provider's status, in the panel's existing shape.
+       *
+       * A thunk rather than a value, so the panel always renders the harness that
+       * is current at push time — and a function rather than a provider, so the
+       * panel keeps its existing contract and cannot depend on which backend is
+       * in use.
+       */
+      runtimeStatus: () => RuntimeStatus;
       workspace: WorkspaceContext | (() => WorkspaceContext | null);
       logger: { info(m: string): void; warn(m: string): void; error(m: string, e?: unknown): void };
       onMessage(raw: unknown): void | Promise<void>;
@@ -133,7 +141,7 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
       state,
       projectName: workspace ? workspace.projectName : 'No folder',
       workspaceName: workspace ? workspace.workspaceRoot : '',
-      runtime: this.deps.runtime.getStatus(),
+      runtime: this.deps.runtimeStatus(),
       sessionId: session?.id ?? null,
       runtimeSessionId: session?.runtimeSessionId ?? null,
       messages: session?.messages ?? [],
@@ -148,6 +156,11 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
       pendingFilePath: orchestrator.pendingFilePathValue,
       pendingFileOperation: orchestrator.pendingFileOperationValue,
       activeProposal,
+      // Null for a single-file proposal, so the panel can decide whether to show
+      // the set machinery at all rather than rendering a permanent "1 of 1".
+      changeProgress: orchestrator.changeProgressValue,
+      changePlan: orchestrator.changeSetPlanValue,
+      workflowMode: orchestrator.workflowModeView,
       usage: session?.usage ?? {
         inputTokens: 0,
         outputTokens: 0,
