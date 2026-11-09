@@ -1,0 +1,220 @@
+{
+  "name": "pairpilot",
+  "displayName": "PairPilot",
+  "description": "Human-controlled AI pair programming. The AI proposes, you review and approve, then PairPilot writes the code in your real editor.",
+  "version": "0.1.1",
+  "publisher": "mtafakori1993",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "pair programming",
+    "claude",
+    "code review",
+    "approval"
+  ],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "PairPilot runs the Claude Code CLI with file access, so it requires a trusted workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "PairPilot writes files through the local file system."
+    }
+  },
+  "activationEvents": [
+    "onView:pairpilot.sidebarView"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pairpilot",
+          "title": "PairPilot",
+          "icon": "media/pairpilot.svg"
+        }
+      ]
+    },
+    "views": {
+      "pairpilot": [
+        {
+          "type": "webview",
+          "id": "pairpilot.sidebarView",
+          "name": "PairPilot",
+          "icon": "media/pairpilot.svg",
+          "contextualTitle": "PairPilot"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "pairpilot.focus",
+        "title": "PairPilot: Focus Sidebar",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.newSession",
+        "title": "PairPilot: New Session",
+        "category": "PairPilot",
+        "icon": "$(add)"
+      },
+      {
+        "command": "pairpilot.resumeSession",
+        "title": "PairPilot: Resume Session…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.cancel",
+        "title": "PairPilot: Cancel Current Operation",
+        "category": "PairPilot",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "pairpilot.revertLastWrite",
+        "title": "PairPilot: Revert Last Unapproved Write",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.showUsage",
+        "title": "PairPilot: Show Token Usage",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.checkRuntime",
+        "title": "PairPilot: Check AI Runtime",
+        "category": "PairPilot"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "pairpilot.newSession",
+          "when": "view == pairpilot.sidebarView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "pairpilot.cancel",
+          "when": "view == pairpilot.sidebarView",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "PairPilot",
+      "properties": {
+        "pairpilot.runtime.claudePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the Claude Code CLI executable. Leave empty to auto-detect (`claude` on `PATH`, then common install locations)."
+        },
+        "pairpilot.runtime.useBareMode": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run the CLI with `--bare`, which skips built-in prompt scaffolding, tool definitions and `CLAUDE.md` auto-discovery. Substantially reduces input tokens per call. Disable only if you rely on custom `CLAUDE.md` context."
+        },
+        "pairpilot.runtime.timeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "minimum": 10000,
+          "description": "Maximum time in milliseconds for a single AI turn before the process is terminated."
+        },
+        "pairpilot.runtime.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments passed to the Claude Code CLI. Arguments that would re-enable file-writing tools or bypass permissions are rejected for safety."
+        },
+        "pairpilot.context.maxFiles": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum number of workspace files included in a single AI request."
+        },
+        "pairpilot.context.maxFileBytes": {
+          "type": "number",
+          "default": 65536,
+          "minimum": 1024,
+          "description": "Maximum size in bytes for a single file included as context. Larger files are truncated."
+        },
+        "pairpilot.context.maxTotalChars": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 2000,
+          "description": "Maximum total number of characters of file content included in a single AI request."
+        },
+        "pairpilot.context.treeDepth": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 8,
+          "description": "Depth of the workspace tree summary included in the request."
+        },
+        "pairpilot.context.includeTree": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include a shallow workspace tree summary in AI requests. No file contents are included by this option."
+        },
+        "pairpilot.safety.requireSensitiveFileApproval": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a modal confirmation before any sensitive file (for example `.env`, `.npmrc`, credential files) is read as context or written."
+        },
+        "pairpilot.safety.allowSensitiveFileContext": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow sensitive files to be offered as context at all. Even when enabled, each file still requires explicit per-file approval. Private keys and `.git` internals are always blocked."
+        },
+        "pairpilot.advisor.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "After an approval, analyze the code and recommend exactly one next engineering step."
+        },
+        "pairpilot.advisor.useAI": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use the AI runtime for the next-step recommendation. When disabled, PairPilot uses its local dependency analysis only."
+        },
+        "pairpilot.session.maxHistory": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum number of sessions kept in local workspace storage."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --production",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "PAIRPILOT_LIVE_TESTS=1 vitest run",
+    "package": "node esbuild.js --production && vsce package --no-dependencies --allow-missing-repository -o pairpilot.vsix",
+    "test:vscode": "node test/vscode/build.mjs && node out-test/runTests.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^4.1.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.0",
+    "vitest": "^5.1.0"
+  }
+}

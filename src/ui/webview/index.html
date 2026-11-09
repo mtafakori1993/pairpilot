@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      Content Security Policy.
+
+      `default-src 'none'` means the panel cannot load anything from the network,
+      which is what keeps AI-produced text from ever fetching a remote resource.
+      Scripts and styles are permitted only from this extension's own webview
+      root, injected as a nonce-bearing URI by the provider. No inline script, no
+      eval, no remote fonts.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src {{cspSource}} data:; style-src {{cspSource}}; script-src 'nonce-{{nonce}}'; font-src {{cspSource}};"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="{{styleUri}}" />
+    <title>PairPilot</title>
+  </head>
+  <body>
+    <!-- ------------------------------------------------------------ header -->
+    <header class="header">
+      <div class="header-row">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>PairPilot</span>
+        </div>
+        <span id="state-pill" class="state-pill">Idle</span>
+      </div>
+      <div class="header-meta">
+        <span class="meta-label">Project</span>
+        <span id="project-name">—</span>
+        <span class="meta-label">Runtime</span>
+        <span id="runtime-status">Detecting…</span>
+        <span class="meta-label">Session</span>
+        <span id="session-label">No session</span>
+      </div>
+    </header>
+
+    <!-- -------------------------------------------------------------- tabs -->
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="chat" role="tab">Chat</button>
+      <button class="tab" data-tab="review" role="tab">
+        Review <span id="review-badge" class="badge" style="display: none">!</span>
+      </button>
+      <button class="tab" data-tab="context" role="tab">Context</button>
+      <button class="tab" data-tab="sessions" role="tab">Sessions</button>
+    </nav>
+
+    <!-- -------------------------------------------------------------- body -->
+    <main class="body">
+      <div id="notice-area"></div>
+
+      <section id="panel-chat" class="panel active">
+        <div id="task-status"></div>
+        <div id="messages" class="messages"></div>
+      </section>
+
+      <section id="panel-review" class="panel">
+        <div id="review-content"></div>
+      </section>
+
+      <section id="panel-context" class="panel">
+        <div class="section-title">Files sent with the last request</div>
+        <div id="context-chips" class="context-list"></div>
+        <div class="hint">
+          The AI cannot read your workspace by itself: tool use is disabled so it can never
+          modify a file on its own. PairPilot decides what to send, and never sends the whole
+          project. Sensitive files such as <code>.env</code> require your approval every time.
+        </div>
+        <div class="section-title">Advisor</div>
+        <div id="advisor-content"></div>
+      </section>
+
+      <section id="panel-sessions" class="panel">
+        <div id="sessions-content"></div>
+        <div class="section-title">Token usage</div>
+        <div id="usage-content"></div>
+      </section>
+    </main>
+
+    <!-- ---------------------------------------------------------- composer -->
+    <footer class="composer">
+      <textarea
+        id="task-input"
+        rows="3"
+        placeholder="Describe one task — for example: create src/services/user-service.ts with a UserService class…"
+        aria-label="Task instruction"
+      ></textarea>
+      <div class="composer-actions">
+        <button id="add-context-button" class="secondary">Add active file</button>
+        <span class="spacer"></span>
+        <button id="cancel-button" class="secondary" disabled>Cancel</button>
+        <button id="send-button">Send</button>
+      </div>
+      <div id="composer-hint" class="hint"></div>
+    </footer>
+
+    <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+  </body>
+</html>

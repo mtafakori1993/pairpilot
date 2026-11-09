@@ -1,0 +1,24 @@
+.vscode/**
+.vscode-test/**
+src/**
+test/**
+out/**
+node_modules/**
+dist/**/*.map
+**/*.ts
+**/*.map
+.gitignore
+esbuild.js
+tsconfig.json
+vitest.config.ts
+pairpilot.vsix
+**/.DS_Store
+out-test/
+out-test/**
+# Not currently picked up by vsce, but excluded explicitly so a future change to
+# its file-selection cannot silently ship a 130 KB lockfile in the package.
+package-lock.json
+# Design sources (full-resolution logo). Kept in the repo so `media/icon.png` can
+# be re-exported at other sizes, but never shipped: it is 160 KB of raw artwork
+# that the extension does not load at runtime.
+assets/**
