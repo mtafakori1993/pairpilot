@@ -313,6 +313,8 @@ export function parseProtocol(text: string): ProtocolParseOutcome {
   const primaries = primaryCandidates(text);
   let sawJson = false;
   let best: ProtocolParseFailure | null = null;
+  /** Whole documents that parsed as JSON but were refused — their own fragments are not independent messages. */
+  const rejectedWholes: string[] = [];
 
   for (const candidate of primaries) {
     const outcome = readCandidate(candidate);
@@ -321,28 +323,49 @@ export function parseProtocol(text: string): ProtocolParseOutcome {
     }
     if (outcome.kind !== 'unparsable') {
       sawJson = true;
+      rejectedWholes.push(candidate);
     }
     best = betterFailure(best, outcome);
   }
 
-  // The reply was JSON, but not a usable message. Report that, rather than
-  // hunting for a fragment of it that happens to validate.
-  if (sawJson && best) {
-    return best;
-  }
-
   // --- Tier two: the payload is embedded in prose --------------------------
+  //
+  // The scan now runs whenever tier one did not produce a usable message —
+  // including when a primary candidate was *valid JSON of the wrong shape*.
+  // That case is the reported failure: a reply can open with a summary-shaped
+  // JSON object ({"type":"code_proposal","message":"Creates a simple x.html
+  // page…"} with no changes) and carry the real, complete proposal further
+  // down. Stopping at the first JSON object handed the developer the contract
+  // error while the actual file content sat unread a paragraph later.
+  //
+  // What must NOT happen is a fragment of an already-rejected document being
+  // accepted on its own — writing one file out of a proposal the validator has
+  // just refused as a set. The distinguishing fact is containment: a fragment
+  // of the rejected reply appears verbatim inside its text, while a genuine
+  // second message elsewhere in the reply does not. Substring containment is
+  // therefore the gate: anything the rejected whole already contains is part
+  // of what was refused, and everything else is a message in its own right.
   const seen = new Set(primaries);
   for (const object of extractBalancedObjects(text)) {
     if (seen.has(object)) {
       continue;
     }
     seen.add(object);
+    if (rejectedWholes.some((whole) => whole.includes(object))) {
+      continue;
+    }
     const outcome = readCandidate(object);
     if (outcome.ok) {
       return outcome;
     }
     best = betterFailure(best, outcome);
+  }
+
+  // The reply was JSON, but not a usable message, and no embedded object was
+  // either. Report the tier-one failure, which names the model's own reply
+  // rather than some fragment of it.
+  if (sawJson && best) {
+    return best;
   }
 
   if (best) {

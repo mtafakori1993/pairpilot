@@ -2,7 +2,7 @@
   "name": "pairpilot",
   "displayName": "PairPilot",
   "description": "Human-controlled AI pair programming. The AI proposes, you review and approve, then PairPilot writes the code in your real editor.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "mtafakori1993",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -34,7 +34,6 @@
   },
   "activationEvents": [
     "onView:pairpilot.sidebarView",
-    "onView:pairpilot.providersView",
     "onView:pairpilot.costView",
     "onCommand:pairpilot.setApiKey",
     "onCommand:pairpilot.testConnection",
@@ -42,7 +41,17 @@
     "onCommand:pairpilot.refreshModelCatalog",
     "onCommand:pairpilot.clearUsageHistory",
     "onCommand:pairpilot.openProviderSettings",
-    "onCommand:pairpilot.openKeyPage"
+    "onCommand:pairpilot.openKeyPage",
+    "onCommand:pairpilot.selectProvider",
+    "onCommand:pairpilot.selectModel",
+    "onCommand:pairpilot.selectGlobalModel",
+    "onCommand:pairpilot.selectPlanningModel",
+    "onCommand:pairpilot.selectCodingModel",
+    "onCommand:pairpilot.selectReviewModel",
+    "onCommand:pairpilot.approveReview",
+    "onCommand:pairpilot.rejectReview",
+    "onCommand:pairpilot.requestChangesReview",
+    "onCommand:pairpilot.reviewWaitingFile"
   ],
   "contributes": {
     "viewsContainers": {
@@ -62,14 +71,6 @@
           "name": "PairPilot",
           "icon": "media/pairpilot.svg",
           "contextualTitle": "PairPilot"
-        },
-        {
-          "type": "webview",
-          "id": "pairpilot.providersView",
-          "name": "AI Providers & Models",
-          "icon": "media/pairpilot.svg",
-          "contextualTitle": "AI Providers & Models",
-          "visibility": "collapsed"
         },
         {
           "type": "webview",
@@ -120,11 +121,6 @@
         "category": "PairPilot"
       },
       {
-        "command": "pairpilot.showProviders",
-        "title": "PairPilot: Show AI Providers & Models",
-        "category": "PairPilot"
-      },
-      {
         "command": "pairpilot.showCosts",
         "title": "PairPilot: Show Cost & Usage",
         "category": "PairPilot"
@@ -150,6 +146,46 @@
         "category": "PairPilot"
       },
       {
+        "command": "pairpilot.selectProvider",
+        "title": "PairPilot: Select Provider…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectModel",
+        "title": "PairPilot: Select Model…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectGlobalModel",
+        "title": "PairPilot: Select Global Default Model…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectPlanningModel",
+        "title": "PairPilot: Select Planning Model…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectCodingModel",
+        "title": "PairPilot: Select Coding Model…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectReviewModel",
+        "title": "PairPilot: Select Review Model…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectAdvisorModel",
+        "title": "PairPilot: Select Engineering Advisor Model…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.selectProjectModel",
+        "title": "PairPilot: Select Model for This Project…",
+        "category": "PairPilot"
+      },
+      {
         "command": "pairpilot.clearUsageHistory",
         "title": "PairPilot: Clear Usage History…",
         "category": "PairPilot"
@@ -162,6 +198,31 @@
       {
         "command": "pairpilot.openKeyPage",
         "title": "PairPilot: Open OpenRouter Key Page",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.approveReview",
+        "title": "PairPilot: Approve the Written File",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.rejectReview",
+        "title": "PairPilot: Reject the Written File",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.requestChangesReview",
+        "title": "PairPilot: Request Changes to the Written File…",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.openReviewThread",
+        "title": "PairPilot: Open the Review for This File",
+        "category": "PairPilot"
+      },
+      {
+        "command": "pairpilot.reviewWaitingFile",
+        "title": "PairPilot: Review the File Waiting for a Decision",
         "category": "PairPilot"
       }
     ],
@@ -178,18 +239,37 @@
           "group": "navigation@2"
         },
         {
-          "command": "pairpilot.refreshModelCatalog",
-          "when": "view == pairpilot.providersView",
-          "group": "navigation@1"
-        },
-        {
-          "command": "pairpilot.openProviderSettings",
-          "when": "view == pairpilot.providersView",
-          "group": "navigation@2"
-        },
-        {
           "command": "pairpilot.clearUsageHistory",
           "when": "view == pairpilot.costView",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "pairpilot.refreshModelCatalog"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "pairpilot.approveReview",
+          "when": "commentController == pairpilot.review",
+          "group": "inline@1"
+        },
+        {
+          "command": "pairpilot.requestChangesReview",
+          "when": "commentController == pairpilot.review",
+          "group": "inline@2"
+        },
+        {
+          "command": "pairpilot.rejectReview",
+          "when": "commentController == pairpilot.review",
+          "group": "inline@3"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "pairpilot.openReviewThread",
+          "when": "commentController == pairpilot.review",
           "group": "navigation@1"
         }
       ]

@@ -59,12 +59,13 @@ import { interpretTurn, renderMessage } from '../proposals/TurnInterpreter';
 import { ProposalValidator, toValidatedProposal } from '../proposals/ProposalValidator';
 import { ApprovalManager, toProposalRecord } from '../proposals/ApprovalManager';
 import { BatchQueue, type BatchFileEntry } from '../proposals/BatchQueue';
+import type { Continuation } from '../roadmap/RoadmapContinuation';
 import { LiveWriter } from '../editor/LiveWriter';
 import type { DiffManager } from '../editor/DiffManager';
 import type { WorkspaceContext, ContextBudget } from '../context/WorkspaceContext';
 import type { SessionStore } from '../storage/SessionStore';
 import { ProtocolDiagnostics, redactSecrets } from '../protocol/diagnostics';
-import { expectedTypeHint } from '../protocol/classify';
+import { codeProposalDemandHint, expectedTypeHint } from '../protocol/classify';
 import {
   WORKFLOW_MODE_META,
   classifyIntention,
@@ -114,12 +115,122 @@ export interface OrchestratorDeps {
   diff: DiffManager;
   /** Broadcast a state change to the UI. */
   notify(): void;
-  /** Stream a code delta to the UI for the live preview. */
-  notifyCodeDelta(blockIndex: number, text: string): void;
   /** Stream assistant text to the UI. */
   notifyTextDelta(text: string): void;
   notifyWritingProgress(written: number, total: number, relativePath: string): void;
+  /**
+   * Open the in-editor review for a file that has just been written.
+   *
+   * A hook rather than a direct import: the review surface is editor UI, and the
+   * Orchestrator must stay constructible in a test with no editor at all. The
+   * function is awaited so a failure to open the file is reported before the
+   * workflow moves on.
+   */
+  openReview?(
+    review: OrchestratorReviewRequest
+  ): void | Promise<void>;
+  /**
+   * Ask the developer whether a file may be written, in native UI.
+   *
+   * The counterpart of `openReview`, and deliberately a separate hook: this
+   * question is asked *before* the workspace is touched, when there is no code
+   * in the editor to review. The answer arrives back through
+   * `approveFileCreation` / `rejectFileCreation` / `requestChangesBeforeWrite`,
+   * which re-verify it against live state — a hook here can show a prompt but
+   * cannot authorise a write.
+   *
+   * Optional so the workflow stays constructible in a test with no UI.
+   */
+  askWritePermission?(
+    request: OrchestratorWritePermissionRequest
+  ): void | Promise<void>;
+  /**
+   * The project roadmap, if one governs this project.
+   *
+   * Two capabilities, both optional so the workflow still runs in a project that
+   * has never been planned:
+   *
+   *  - `describeForPrompt` supplies the plan the coding turn is given, and
+   *  - `afterApproval` is called when the last file of a batch has been
+   *    approved, and answers what to open next — the next file of the same task,
+   *    the first file of the next eligible task, or nothing.
+   *
+   * A hook rather than an import for the same reason as `openReview`: the
+   * Orchestrator must not need a workspace or an editor to be constructed.
+   */
+  roadmap?: RoadmapDeps;
   readConfig(): OrchestratorConfig;
+}
+
+/** The part of the roadmap workflow the workflow uses. */
+export interface RoadmapDeps {
+  describeForPrompt(): Promise<string | null>;
+  /**
+   * Record an approval and answer what to open next.
+   *
+   * `verified` is deliberately *not* an input: confirmation that the work
+   * actually checks out involves asking the developer, which is UI. The adapter
+   * asks, then applies the rule this workflow cannot afford to get wrong — that
+   * `done` is never written on an approval alone.
+   */
+  advance(input: {
+    relativePath: string;
+    approvedPaths: readonly string[];
+  }): Promise<Continuation>;
+}
+
+/**
+ * What the workflow tells the editor about a written file.
+ *
+ * `contentHash` is the binding the decision must echo back; `documentFingerprint`
+ * is what the review captures when it opens. They are separate on purpose: the
+ * hash says *which proposal*, the fingerprint says *which bytes are on screen
+ * now*.
+ */
+export interface OrchestratorReviewRequest {
+  readonly sessionId: string;
+  readonly relativePath: string;
+  readonly absolutePath: string;
+  readonly operation: 'create' | 'update';
+  readonly description: string;
+  readonly rationale: string | null;
+  readonly contentHash: string;
+  readonly binding: {
+    readonly proposalId?: string;
+    readonly proposalVersion?: number;
+    readonly fileId?: string;
+  };
+  readonly documentLine: number;
+  readonly position: { readonly index: number; readonly total: number } | null;
+}
+
+/**
+ * What the workflow asks before it writes anything.
+ *
+ * This is the pre-write half of the review machinery, and it is a *question*,
+ * not a report: nothing has been written when it is asked. `contentHash` is the
+ * same binding every later decision uses, so an answer given for an older
+ * version of the file is refused by `ApprovalManager.verify`.
+ *
+ * `setHash` is present only when the proposal holds more than one file. It is
+ * what makes "write all of them" a single explicit answer rather than a
+ * permission quietly inferred from the first file's approval.
+ */
+export interface OrchestratorWritePermissionRequest {
+  readonly sessionId: string;
+  readonly relativePath: string;
+  readonly absolutePath: string;
+  readonly operation: 'create' | 'update';
+  readonly description: string;
+  readonly rationale: string | null;
+  readonly contentHash: string;
+  readonly setHash: string | null;
+  readonly position: { readonly index: number; readonly total: number } | null;
+  readonly binding: {
+    readonly proposalId?: string;
+    readonly proposalVersion?: number;
+    readonly fileId?: string;
+  };
 }
 
 export interface OrchestratorConfig {
@@ -210,6 +321,14 @@ export class Orchestrator {
    * is how revising one file used to discard the rest of the batch.
    */
   private revisingPath: string | null = null;
+
+  /**
+   * The next file the roadmap offered, waiting for the developer to start it.
+   *
+   * An offer rather than a queued turn: the roadmap may say what comes next, but
+   * only the developer starts a coding turn. Cleared when the workflow resets.
+   */
+  private pendingRoadmapFile: { relativePath: string; taskId: string } | null = null;
 
   /**
    * The file currently being streamed into the editor, if any.
@@ -585,10 +704,19 @@ export class Orchestrator {
     );
 
     const turnShape = intention.intention === 'general_chat' ? 'conversational' : 'engineering';
-    const typeHint = `${buildPolicyHint(policy, turnShape)}\n\n${expectedTypeHint(
-      turnShape,
-      policy.allowsProposals
-    )}`;
+    // In a mode that allows proposals, an instruction classified as code work
+    // gets the *demand* hint rather than the type menu. The menu invites the
+    // model to weigh "describe it" against "write it"; for a build instruction
+    // that weighing is the failure mode, because a summary-shaped
+    // code_proposal passes the "valid JSON" bar and then breaks the contract
+    // on `/changes` — the exact reported error. The mode gate below still
+    // refuses a proposal the policy forbids, whatever the hint said.
+    const typeHint = policy.allowsProposals && isCodeWorkIntention(intention.intention)
+      ? `${buildPolicyHint(policy, turnShape)}\n\n${codeProposalDemandHint()}`
+      : `${buildPolicyHint(policy, turnShape)}\n\n${expectedTypeHint(
+          turnShape,
+          policy.allowsProposals
+        )}`;
 
     let correction: string | undefined;
     /** The most recent schema failure, kept so the final error is the real one. */
@@ -612,7 +740,7 @@ export class Orchestrator {
       this.deps.notify();
 
       const prompt = buildProposalPrompt({
-        ...this.promptContext(assembled, task),
+        ...(await this.promptContext(assembled, task)),
         typeHint,
         ...(correction !== undefined ? { correction } : {}),
       });
@@ -764,10 +892,11 @@ export class Orchestrator {
   }
 
   /** Build the per-turn prompt sections that do not change between attempts. */
-  private promptContext(
+  private async promptContext(
     assembled: Awaited<ReturnType<WorkspaceContext['assemble']>>,
     task: string
-  ): TurnPromptInput {
+  ): Promise<TurnPromptInput> {
+    const roadmap = await this.describeRoadmap();
     return {
       task,
       ...(assembled.activeFile !== undefined ? { activeFile: assembled.activeFile } : {}),
@@ -778,7 +907,28 @@ export class Orchestrator {
         truncated: file.truncated,
       })),
       pinnedContext: [...this.pinnedContext],
+      ...(roadmap !== null ? { roadmap } : {}),
     };
+  }
+
+  /**
+   * The roadmap text for the prompt, or `null` when there is nothing to say.
+   *
+   * A roadmap that cannot be read is not a reason to fail the turn: the
+   * developer asked for a file, not for a report on their markdown. It is logged
+   * and the turn proceeds without it.
+   */
+  private async describeRoadmap(): Promise<string | null> {
+    const roadmap = this.deps.roadmap;
+    if (!roadmap) {
+      return null;
+    }
+    try {
+      return await roadmap.describeForPrompt();
+    } catch (error) {
+      this.deps.logger.warn(`The roadmap could not be read for the prompt: ${describeError(error)}`);
+      return null;
+    }
   }
 
   /**
@@ -1025,7 +1175,6 @@ export class Orchestrator {
           }
           // Live preview in the Webview.
           this.streamingCode[blockIndex] = (this.streamingCode[blockIndex] ?? '') + delta;
-          this.deps.notifyCodeDelta(blockIndex, delta);
           // And, when a write is open, straight into the real editor.
           this.writer?.push(delta);
         },
@@ -1123,6 +1272,68 @@ export class Orchestrator {
     const verb = this.pendingFileOperation === 'create' ? 'create' : 'update';
     this.currentStep = `Waiting for your permission to ${verb} ${change.relativePath}${position}`;
     this.deps.notify();
+
+    // The prompt is raised after the state change, so a UI that renders the new
+    // state and the prompt cannot see one without the other. It is not awaited:
+    // the turn waits for an *answer*, which arrives through one of the decision
+    // methods below, not for the prompt to be dismissed.
+    this.requestWritePermission(change);
+  }
+
+  /**
+   * Raise the native permission prompt for the change waiting at the gate.
+   *
+   * Every answer this prompt can produce is re-checked by `approveFileCreation`,
+   * `rejectFileCreation` or `requestChangesBeforeWrite` against the live
+   * `ApprovalManager`, so the prompt has no authority of its own — it can ask,
+   * and a forged or stale answer still fails. That is why the hook is fired and
+   * forgotten here: nothing it does can widen what the workflow permits.
+   */
+  private requestWritePermission(change: ValidatedChange): void {
+    const hook = this.deps.askWritePermission;
+    if (!hook) {
+      return;
+    }
+
+    const total = this.changeQueue.length;
+    const request: OrchestratorWritePermissionRequest = {
+      sessionId: `permission:${this.activeTurnId}:${change.relativePath}:${change.contentHash.slice(0, 12)}`,
+      relativePath: change.relativePath,
+      absolutePath: change.absolutePath,
+      operation: this.pendingFileOperation ?? 'create',
+      description: change.change.description,
+      rationale:
+        typeof change.change.rationale === 'string' && change.change.rationale.length > 0
+          ? change.change.rationale
+          : null,
+      contentHash: change.contentHash,
+      // Only a set of several files can be authorised at once; for one file the
+      // set hash and the file hash would be the same question asked twice.
+      setHash: total > 1 ? this.changeSet?.changeSetHash ?? null : null,
+      position: total > 1 ? { index: this.changeCursor + 1, total } : null,
+      binding: {
+        ...(this.batch ? { proposalId: this.batch.proposalId } : {}),
+        ...(this.batch ? { proposalVersion: this.batch.proposalVersion } : {}),
+        ...(this.batch?.byRelativePath(change.relativePath)
+          ? { fileId: this.batch.byRelativePath(change.relativePath)!.fileId }
+          : {}),
+      },
+    };
+
+    try {
+      void Promise.resolve(hook(request)).catch((error: unknown) => {
+        // A prompt that could not be shown must not stall the gate silently: the
+        // palette can raise it again, so this is reported as a warning in the
+        // log while the workflow keeps waiting for an answer.
+        this.deps.logger.warn(
+          `Could not ask for permission to write "${change.relativePath}": ${describeError(error)}`
+        );
+      });
+    } catch (error) {
+      this.deps.logger.warn(
+        `Could not ask for permission to write "${change.relativePath}": ${describeError(error)}`
+      );
+    }
   }
 
   /**
@@ -1333,8 +1544,9 @@ export class Orchestrator {
       this.deps.notify();
 
       // Open the file so the code is visible in the real editor, not just the
-      // Webview (spec section 8).
-      await this.revealInEditor(proposal.absolutePath);
+      // Webview (spec section 8), and anchor the review to it. The review is
+      // the only place a decision can now come from.
+      await this.openEditorReview(proposal);
     } catch (error) {
       this.batch?.releaseWrite(proposal.relativePath);
       this.writingProposal = null;
@@ -1537,6 +1749,12 @@ export class Orchestrator {
     this.batch?.markApproved(proposal.relativePath);
     this.deps.notify();
 
+    // `advanceAfterFile` may settle the turn, ending in ordering *two* nested
+    // turns (the next file's, then the advisor's). Without resetting the turn
+    // counter, `assertCurrentTurn` in the second one rejects the first one's id
+    // — and the file the roadmap just offered would be thrown away by the catch
+    // that treats it as an advisor failure.
+    this.activeTurnId += 1;
     await this.advanceAfterFile(proposal.relativePath, this.activeTurnId, {});
   }
 
@@ -1701,6 +1919,12 @@ export class Orchestrator {
    */
   private async afterSetApproved(proposal: ValidatedProposal): Promise<void> {
     const turnId = ++this.activeTurnId;
+
+    // Captured *before* the advisor and before the change set is discarded:
+    // `resetChangeSet` clears the batch and the approval history, so reading
+    // them afterwards would report an approval that no longer exists anywhere.
+    const approvedPaths = this.approvedPaths();
+
     try {
       const code = this.readFileQuietly(proposal.absolutePath) ?? proposal.assembledCode;
       await this.runAdvisorTurn(turnId, {
@@ -1724,6 +1948,124 @@ export class Orchestrator {
       this.resetChangeSet();
       this.deps.notify();
     }
+
+    // Only after the turn has settled: the roadmap is a record of what happened
+    // and must never be advanced by a turn that then failed. Awaited so the
+    // status edit is finished before the developer is offered the next file.
+    await this.advanceRoadmap(proposal.relativePath, approvedPaths);
+  }
+
+  /**
+   * Offer the next file the roadmap says comes next.
+   *
+   * This is the spec's loop closing: approval → roadmap update → next eligible
+   * task → open its file. Everything that can go wrong here is already handled
+   * by `RoadmapContinuation`; what this method adds is the transition back into
+   * the workflow, so the next file is a proposal the developer reviews in the
+   * editor rather than a notification they have to act on themselves.
+   *
+   * @param approvedPaths Captured before the change set was reset — after that,
+   *   the batch and the approval history that name these files are gone.
+   */
+  private async advanceRoadmap(
+    relativePath: string,
+    approvedPaths: readonly string[]
+  ): Promise<void> {
+    const roadmap = this.deps.roadmap;
+    if (!roadmap) {
+      return;
+    }
+
+    // A revision of an already-approved file does not move the roadmap: the
+    // task's progress is about which files are settled, not about how many
+    // times one of them was rewritten.
+    if (!approvedPaths.includes(relativePath)) {
+      return;
+    }
+
+    let continuation: Continuation;
+    try {
+      continuation = await roadmap.advance({ relativePath, approvedPaths });
+    } catch (error) {
+      this.deps.logger.warn(`The roadmap could not be advanced: ${describeError(error)}`);
+      return;
+    }
+
+    switch (continuation.kind) {
+      case 'next_file':
+      case 'next_task':
+        this.offerRoadmapFile(continuation);
+        return;
+      case 'awaiting_verification':
+        this.notice =
+          `Every file of "${continuation.taskId}" has been written and approved. ` +
+          'Its roadmap task stays in progress until the work has been verified — run the checks, then mark it done.';
+        this.deps.notify();
+        return;
+      case 'complete':
+        this.notice = `The roadmap is complete: ${continuation.approvedCount} files were written and approved.`;
+        this.deps.notify();
+        return;
+      case 'blocked':
+        this.notice = `The roadmap could not move forward: ${continuation.reason}`;
+        this.deps.notify();
+        return;
+      case 'unlisted':
+        // A file outside the plan. Nothing to say beyond the approval itself,
+        // which the turn has already reported.
+        return;
+      case 'no_roadmap':
+        return;
+    }
+  }
+
+  /** Turn "open this file" into the next turn, gated exactly as any other. */
+  private offerRoadmapFile(next: { relativePath: string; taskId: string }): void {
+    // Recorded as an *offer*, not a turn: the developer starts it. This is the
+    // same gate every other write passes through, which is the point.
+    this.pendingRoadmapFile = { relativePath: next.relativePath, taskId: next.taskId };
+    this.notice = `The roadmap continues with ${next.relativePath} (${next.taskId}).`;
+    this.deps.notify();
+  }
+
+  /**
+   * Begin the next file the roadmap offered.
+   *
+   * Called from the UI when the developer accepts, so the roadmap never starts a
+   * coding turn on its own — a plan is permission to *suggest* the next file,
+   * not to write it.
+   */
+  async continueRoadmap(): Promise<void> {
+    const next = this.pendingRoadmapFile;
+    if (!next) {
+      return;
+    }
+    if (this.machine.isBusy() || this.machine.isAwaitingHuman()) {
+      this.error = 'Finish the current file before starting the next one.';
+      this.deps.notify();
+      return;
+    }
+    this.pendingRoadmapFile = null;
+    await this.submitTask(
+      `Write ${next.relativePath} now, following the roadmap. This is the only file to write in this turn.`
+    );
+  }
+
+  /** The next file the roadmap offered, for the UI to offer to the developer. */
+  get offeredRoadmapFile(): { relativePath: string; taskId: string } | null {
+    return this.pendingRoadmapFile;
+  }
+
+  /** The files this session has approved, closed out and in order. */
+  private approvedPaths(): string[] {
+    const fromBatch =
+      this.batch?.all().filter((entry) => entry.status === 'approved').map((entry) => entry.relativePath) ??
+      [];
+    const fromApprovals = this.approvals
+      .getHistory()
+      .filter((record) => record.decision === 'approve')
+      .map((record) => record.relativePath);
+    return [...new Set([...fromBatch, ...fromApprovals])];
   }
 
   /** The developer rejected the written code. The file is rolled back. */
@@ -1782,6 +2124,53 @@ export class Orchestrator {
     this.discardRemainingChanges();
   }
 
+  /**
+   * The developer asked for a different proposal *before* anything was written.
+   *
+   * The same outcome as `requestChanges`, with the rollback removed because
+   * there is nothing to roll back: the gate is reached before `LiveWriter` has
+   * touched the file, so declining here leaves the workspace exactly as it was.
+   * The revision request itself is shared with the written-file path, so both
+   * routes produce one revision turn rather than two behaviours.
+   */
+  async requestChangesBeforeWrite(
+    contentHash: string,
+    feedback: string,
+    binding?: DecisionBindingInput
+  ): Promise<void> {
+    if (!this.machine.is(PairPilotState.WAITING_FILE_APPROVAL)) {
+      this.error = 'There is no pending file request to revise.';
+      this.deps.notify();
+      return;
+    }
+    let proposal: ValidatedProposal;
+    try {
+      this.batch?.assertFresh(binding, this.approvals.getPending()?.relativePath);
+      proposal = this.approvals.verify(contentHash);
+    } catch (error) {
+      this.error = describeError(error);
+      this.deps.notify();
+      return;
+    }
+
+    this.approvals.record('request_changes', proposal, { feedback });
+    this.machine.transition(PairPilotState.REQUESTING_CHANGES, 'changes requested before writing');
+
+    // The batch is told this file is being revised rather than written, so its
+    // entry does not sit at "pending" while a revision is in flight, and the
+    // merge in `stageProposal` knows which file the reply replaces.
+    this.batch?.markRevision(proposal.relativePath);
+    this.revisingPath = proposal.relativePath;
+
+    const turnId = ++this.activeTurnId;
+    this.deps.notify();
+    try {
+      await this.retryWithFeedback(proposal, feedback, turnId);
+    } catch (error) {
+      this.handleTurnFailure(error, turnId);
+    }
+  }
+
   /** The developer asked for a revised proposal. */
   async requestChanges(
     contentHash: string,
@@ -1831,6 +2220,18 @@ export class Orchestrator {
   }
 
   /** Re-run the turn with the developer's feedback attached. */
+  /**
+   * Re-run the turn with the developer's feedback attached.
+   *
+   * A revision is code work in a mode that allows proposals, so it asks for a
+   * `code_proposal` outright and gets the same bounded correction loop as the
+   * primary turn: a reply that was valid JSON of the wrong shape — the
+   * summary-shaped `code_proposal` with no `changes` array — is re-requested
+   * with the validator's own complaint, at most `MAX_PROTOCOL_RETRIES` times,
+   * before the turn is failed. Until this loop existed, the revision path made
+   * exactly one request, so the first summary-shaped reply ended the revision
+   * with the contract error and the developer's feedback was lost with it.
+   */
   private async retryWithFeedback(
     previous: ValidatedProposal,
     feedback: string,
@@ -1849,80 +2250,115 @@ export class Orchestrator {
     const assembled =
       this.lastAssembled ?? (await this.deps.workspace.assemble([...this.pinnedContext], config.budget));
     const task = this.currentTask ?? 'Revise the previous proposal.';
-    const prompt = buildProposalPrompt({
-      ...this.promptContext(assembled, task),
-      typeHint: expectedTypeHint('engineering'),
-      feedback,
-      previousProposal: {
-        filePath: previous.relativePath,
-        operation: previous.proposal.operation,
-        code: previous.assembledCode,
-      },
-    });
 
     this.machine.transition(PairPilotState.PROPOSING, 'requesting a revision');
     this.deps.notify();
 
-    const result = await this.runRuntimeTurn({
-      // A revision is still coding work, so it resolves through the same role as
-      // the original proposal.
-      role: 'coding',
-      taskLabel: this.currentTask,
-      prompt,
-      resumeSessionId: this.deps.store.getRuntimeSessionId(record.id),
-      timeoutMs: config.timeoutMs,
-      scanCode: true,
-      turnId,
-    });
-    this.assertCurrentTurn(turnId);
+    let correction: string | undefined;
+    /** The most recent failure, so the final error is the real one. */
+    let lastFailure: ProtocolParseFailure | null = null;
 
-    if (result.cancelled) {
-      throw new CancelledError();
-    }
-    if (result.sessionId) {
-      this.deps.store.setRuntimeSessionId(record.id, result.sessionId);
-    }
-    this.recordUsage(record.id, result.usage, result.isError);
-
-    if (result.isError) {
-      throw new Error(result.errorMessage ?? 'The AI runtime reported an error.');
-    }
-
-    const interpretation = interpretTurn(result.text);
-    this.protocol.record({
-      ok: interpretation.kind !== 'failure',
-      adaptation: interpretation.kind === 'failure' ? 'prose' : interpretation.adaptation,
-      raw: interpretation.kind === 'failure' ? interpretation.failure.raw : result.text,
-      sessionId: record.id,
-      ...(interpretation.kind === 'failure'
-        ? { issues: interpretation.failure.issues, failureKind: interpretation.failure.kind }
-        : { notes: interpretation.notes, messageType: interpretation.message.type }),
-    });
-
-    if (interpretation.kind === 'failure') {
-      this.failTurn(interpretation.failure);
-      return;
-    }
-    if (interpretation.kind !== 'proposal') {
-      this.appendAssistant(record.id, renderMessage(interpretation.message), result.usage);
-      this.machine.tryTransition(PairPilotState.REJECTED, 'the revision was not a proposal');
-      this.machine.tryTransition(PairPilotState.IDLE, 'turn finished');
-      this.notice =
-        'The AI answered with words rather than a new proposal, so nothing was written. Its reply is above.';
-      this.currentStep = null;
+    for (let attempt = 0; attempt <= MAX_PROTOCOL_RETRIES; attempt++) {
+      // Only the first attempt moves the machine; a retry is a second request
+      // from the same state, and the machine refuses self-transitions on
+      // purpose — the same rule the primary turn loop follows.
+      this.currentStep =
+        attempt === 0 ? 'Revising the proposal' : `Correcting the revised proposal (attempt ${attempt + 1})`;
       this.deps.notify();
-      return;
-    }
 
-    const staged = this.stageProposal(interpretation.message, interpretation.notes, record.id);
-    if (!staged.ok) {
-      this.failTurn({
+      const prompt = buildProposalPrompt({
+        ...(await this.promptContext(assembled, task)),
+        // A revision is unambiguously code work: the developer has already seen
+        // the file and asked for it to be different. The type menu invites the
+        // model to narrate instead, which is how a revision turn produced the
+        // same summary-shaped refusal as the original bug.
+        typeHint: codeProposalDemandHint(),
+        feedback,
+        ...(correction !== undefined ? { correction } : {}),
+        previousProposal: {
+          filePath: previous.relativePath,
+          operation: previous.proposal.operation,
+          code: previous.assembledCode,
+        },
+      });
+
+      const result = await this.runRuntimeTurn({
+        // A revision is still coding work, so it resolves through the same role as
+        // the original proposal.
+        role: 'coding',
+        taskLabel: this.currentTask,
+        prompt,
+        resumeSessionId: this.deps.store.getRuntimeSessionId(record.id),
+        timeoutMs: config.timeoutMs,
+        scanCode: true,
+        turnId,
+      });
+      this.assertCurrentTurn(turnId);
+
+      if (result.cancelled) {
+        throw new CancelledError();
+      }
+      if (result.sessionId) {
+        this.deps.store.setRuntimeSessionId(record.id, result.sessionId);
+      }
+      this.recordUsage(record.id, result.usage, result.isError);
+
+      if (result.isError) {
+        throw new Error(result.errorMessage ?? 'The AI runtime reported an error.');
+      }
+
+      const interpretation = interpretTurn(result.text);
+      this.protocol.record({
+        ok: interpretation.kind !== 'failure',
+        adaptation: interpretation.kind === 'failure' ? 'prose' : interpretation.adaptation,
+        raw: interpretation.kind === 'failure' ? interpretation.failure.raw : result.text,
+        sessionId: record.id,
+        ...(interpretation.kind === 'failure'
+          ? { issues: interpretation.failure.issues, failureKind: interpretation.failure.kind }
+          : { notes: interpretation.notes, messageType: interpretation.message.type }),
+      });
+
+      if (interpretation.kind === 'failure') {
+        lastFailure = interpretation.failure;
+        if (interpretation.retryable && attempt < MAX_PROTOCOL_RETRIES) {
+          correction = buildCorrectionPrompt(interpretation.failure.issues);
+          continue;
+        }
+        this.failTurn(lastFailure);
+        return;
+      }
+      if (interpretation.kind !== 'proposal') {
+        this.appendAssistant(record.id, renderMessage(interpretation.message), result.usage);
+        this.machine.tryTransition(PairPilotState.REJECTED, 'the revision was not a proposal');
+        this.machine.tryTransition(PairPilotState.IDLE, 'turn finished');
+        this.notice =
+          'The AI answered with words rather than a new proposal, so nothing was written. Its reply is above.';
+        this.currentStep = null;
+        this.deps.notify();
+        return;
+      }
+
+      const staged = this.stageProposal(interpretation.message, interpretation.notes, record.id);
+      if (staged.ok) {
+        return;
+      }
+      lastFailure = {
         ok: false,
         kind: 'schema',
         reason: 'The revised proposal could not be applied to this workspace.',
         issues: staged.issues,
         raw: result.text,
-      });
+      };
+      if (attempt < MAX_PROTOCOL_RETRIES && stageRetryable(staged.issues)) {
+        correction = buildCorrectionPrompt(staged.issues);
+        continue;
+      }
+      this.failTurn(lastFailure);
+      return;
+    }
+
+    if (lastFailure) {
+      this.failTurn(lastFailure);
     }
   }
 
@@ -2154,6 +2590,10 @@ export class Orchestrator {
   private resetChangeSet(): void {
     this.discardRemainingChanges();
     this.streamingCode = [];
+    // The offer belonged to the change set that just settled: a new turn makes
+    // its own offer, and keeping a stale one would let "Continue" start a file
+    // the roadmap has moved past.
+    this.pendingRoadmapFile = null;
   }
 
   /** Clear everything a finished turn leaves behind. */
@@ -2360,6 +2800,55 @@ export class Orchestrator {
     this.previousContentByPath.set(relativePath, content);
   }
 
+  /**
+   * Publish the written file for in-editor review.
+   *
+   * The file is opened first. A thread created for a document nobody is looking
+   * at is created but invisible, which reads as failure — and the decoration
+   * needs a real editor to attach to.
+   */
+  private async openEditorReview(proposal: ValidatedProposal): Promise<void> {
+    await this.revealInEditor(proposal.absolutePath);
+
+    const hook = this.deps.openReview;
+    if (!hook) {
+      return;
+    }
+
+    const entry = this.batch?.byRelativePath(proposal.relativePath);
+    const index = Math.max(this.changeCursor + 1, 1);
+    const total = Math.max(this.changeQueue.length, 1);
+
+    try {
+      await hook({
+        sessionId: `${this.activeTurnId}:${proposal.relativePath}:${proposal.contentHash.slice(0, 12)}`,
+        relativePath: proposal.relativePath,
+        absolutePath: proposal.absolutePath,
+        operation: proposal.proposal.operation === 'update' ? 'update' : 'create',
+        description: proposal.proposal.description,
+        rationale:
+          typeof proposal.proposal.rationale === 'string' && proposal.proposal.rationale.length > 0
+            ? proposal.proposal.rationale
+            : null,
+        contentHash: proposal.contentHash,
+        binding: {
+          ...(this.batch ? { proposalId: this.batch.proposalId } : {}),
+          ...(this.batch ? { proposalVersion: this.batch.proposalVersion } : {}),
+          ...(entry ? { fileId: entry.fileId } : {}),
+        },
+        documentLine: 0,
+        position: total > 1 ? { index, total } : null,
+      });
+    } catch (error) {
+      // The file is written and valid; failing to anchor its thread is a UI
+      // failure, not a reason to unwind the write. The sidebar still reports
+      // the review state, so the developer is not stuck.
+      this.deps.logger.warn(
+        `Could not open the in-editor review for "${proposal.relativePath}": ${describeError(error)}`
+      );
+    }
+  }
+
   private async revealInEditor(absolutePath: string): Promise<void> {
     try {
       const document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath));
@@ -2558,6 +3047,19 @@ function buildPolicyHint(
   ]
     .filter((line) => line !== '')
     .join('\n');
+}
+
+/**
+ * Which intentions are unambiguously code work, so their turn asks for a
+ * proposal outright rather than offering the type menu.
+ *
+ * `code_review` is deliberately absent: reviewing is a judgement on existing
+ * code, and the review message types carry findings rather than file content,
+ * so demanding a proposal there would push the model into inventing changes
+ * the developer never asked for.
+ */
+function isCodeWorkIntention(intention: TurnIntention): boolean {
+  return intention === 'code_generation' || intention === 'code_modification';
 }
 
 function issuesFromError(error: unknown): ProtocolIssue[] {

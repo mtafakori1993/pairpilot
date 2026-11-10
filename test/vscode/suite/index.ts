@@ -34,6 +34,9 @@ import { PathGuard } from '../../../src/security/PathGuard';
 import { LiveWriter } from '../../../src/editor/LiveWriter';
 import { ProposalValidator } from '../../../src/proposals/ProposalValidator';
 import { BatchQueue } from '../../../src/proposals/BatchQueue';
+import { EditorReview } from '../../../src/review/EditorReview';
+import { RoadmapContinuation } from '../../../src/roadmap/RoadmapContinuation';
+import { RoadmapStore } from '../../../src/roadmap/RoadmapStore';
 import { PAIRPILOT_PROTOCOL_VERSION } from '../../../src/protocol/types';
 import type { CodeProposalMessage, ProposalChange } from '../../../src/protocol/types';
 import type { Logger, ValidatedChange } from '../../../src/types';
@@ -206,6 +209,65 @@ async function closeBatchEditors(): Promise<void> {
   }
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* The roadmap loop, in the real host                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Everything this case owns, in one folder, so a failed run cannot leave a file
+ * behind that makes the next run pass for the wrong reason.
+ */
+const ROADMAP_DIR = 'src/suite-roadmap';
+const ROADMAP_PATH = 'ROADMAP.md';
+
+/** A two-task roadmap: `models` has two files, `repo` depends on it. */
+function roadmapText(): string {
+  return [
+    '# Roadmap',
+    '',
+    'Written by the integration suite, not by a developer.',
+    '',
+    '### models — Domain models',
+    '- files: ' + ROADMAP_DIR + '/User.ts, ' + ROADMAP_DIR + '/Order.ts',
+    '',
+    '### repo — Repository',
+    '- files: ' + ROADMAP_DIR + '/Repo.ts',
+    '- depends-on: models',
+    '',
+  ].join('\n');
+}
+
+/** A writer with no editor-side prompts, for files this case creates itself. */
+async function writeThroughEditor(
+  relativePath: string,
+  code: string,
+  guard: PathGuard
+): Promise<void> {
+  const writer = new LiveWriter({ guard, logger });
+  await writer.begin(relativePath, 'create', {
+    approvedCreate: true,
+    expectedTotal: code.length,
+  });
+  writer.push(code);
+  const outcome = await writer.complete();
+  assert.strictEqual(
+    outcome.status,
+    'completed',
+    `writing ${relativePath} did not complete: ${JSON.stringify(outcome)}`
+  );
+}
+
+async function closeEditorsUnder(prefix: string): Promise<void> {
+  const open = vscode.window.visibleTextEditors.filter((editor) =>
+    editor.document.uri.fsPath.startsWith(prefix)
+  );
+  for (const editor of open) {
+    await vscode.window.showTextDocument(editor.document, { preview: false });
+    await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  }
+}
+
 const cases: Case[] = [
   {
     name: 'the extension is installed and activates',
@@ -233,6 +295,19 @@ const cases: Case[] = [
         'pairpilot.revertLastWrite',
         'pairpilot.showUsage',
         'pairpilot.checkRuntime',
+        // The native provider/model flow. Each one opens a press-and-ask UI, so
+        // the assertion is that the command exists and reaches its handler —
+        // not that it completes, which would need someone to click.
+        'pairpilot.selectProvider',
+        'pairpilot.selectModel',
+        // The in-editor review. Approve and reject are exercised for real by
+        // the batch cases; these must at least exist for the comment thread's
+        // menu to show them.
+        'pairpilot.approveReview',
+        'pairpilot.rejectReview',
+        'pairpilot.requestChangesReview',
+        'pairpilot.openReviewThread',
+        'pairpilot.reviewWaitingFile',
       ];
 
       // Force activation first: command registration happens in activate().
@@ -242,6 +317,36 @@ const cases: Case[] = [
       for (const command of declared) {
         assert.ok(registered.has(command), `command "${command}" is not registered`);
       }
+
+      // Every command the manifest advertises must be registered, not just the
+      // ones this list happens to name. This is what catches a rename in
+      // `package.json` that was not mirrored in code.
+      const manifest = vscode.extensions.getExtension(EXTENSION_ID)?.packageJSON as {
+        contributes?: { commands?: { command: string }[] };
+      };
+      const contributed = (manifest.contributes?.commands ?? []).map((entry) => entry.command);
+      for (const command of contributed) {
+        assert.ok(registered.has(command), `manifest command "${command}" is not registered`);
+      }
+    },
+  },
+
+  {
+    name: 'the review commands decline politely when nothing is waiting',
+    async run() {
+      await vscode.extensions.getExtension(EXTENSION_ID)?.activate();
+
+      // "Review a waiting file" with no live review must report that plainly
+      // rather than open a confirmation for a file that does not exist. It
+      // resolves on its own because nothing is shown to wait for.
+      await vscode.commands.executeCommand('pairpilot.reviewWaitingFile');
+
+      // A decision aimed at a thread that is not live must not throw out of the
+      // command handler: the menu can be clicked on a stale thread, and an
+      // exception there surfaces as an unhandled rejection in the host.
+      await vscode.commands.executeCommand('pairpilot.approveReview', {
+        thread: { contextValue: 'pairpilot.review:never-opened' },
+      });
     },
   },
 
@@ -756,6 +861,223 @@ const cases: Case[] = [
 
       // Nothing was written by this case: it is about exclusion, not content.
       assert.ok(!fs.existsSync(batchDir), 'the locking case should not have written any files');
+    },
+  },
+
+  {
+    name: 'a review opens on the real file, and a stale decision is refused',
+    async run() {
+      const root = requireWorkspaceRoot();
+      const target = `${ROADMAP_DIR}/Reviewed.ts`;
+      const absolute = path.join(root, target);
+
+      await closeEditorsUnder(path.join(root, ROADMAP_DIR));
+      fs.mkdirSync(path.join(root, ROADMAP_DIR), { recursive: true });
+      fs.writeFileSync(absolute, 'export const reviewed = true;\n');
+
+      // A real review surface, with a decision sink instead of the workflow:
+      // this case is about the editor, and the workflow's own application path
+      // is exercised by the batch cases.
+      const decisions: string[] = [];
+      const review = new EditorReview({
+        decide: (_session, result) => {
+          decisions.push(`${result.outcome.decision}:${result.outcome.sessionId}`);
+        },
+        logger,
+      });
+
+      try {
+        await review.openReview({
+          sessionId: 'suite-review-1',
+          relativePath: target,
+          absolutePath: absolute,
+          operation: 'create',
+          description: 'A reviewed file.',
+          rationale: 'The suite wants to know the thread is anchored to the file.',
+          contentHash: 'a'.repeat(64),
+          binding: { proposalId: 'a'.repeat(64), proposalVersion: 1, fileId: 'b'.repeat(16) },
+          documentLine: 0,
+          position: { index: 1, total: 2 },
+        });
+
+        // The review is keyed by the document that is really open, and the file
+        // is really in front of the developer rather than behind a preview tab.
+        const active = vscode.window.activeTextEditor;
+        assert.ok(active, 'opening a review should reveal the file');
+        assert.strictEqual(
+          active.document.uri.fsPath,
+          path.resolve(absolute),
+          'the review should reveal the file it is about'
+        );
+        assert.ok(
+          !active.document.uri.toString().startsWith('git:'),
+          'the review must open the real document, not a diff side'
+        );
+
+        const open = review.find(active.document.uri.toString());
+        assert.ok(open, 'the review should be registered against the open document');
+        assert.strictEqual(open.relativePath, target);
+        assert.strictEqual(review.awaiting().length, 1, 'the review should be waiting');
+
+        // A second file's review must not disturb the first: two sessions, two
+        // documents, no shared decision.
+        const second = `${ROADMAP_DIR}/Other.ts`;
+        fs.writeFileSync(path.join(root, second), 'export const other = true;\n');
+        await review.openReview({
+          sessionId: 'suite-review-2',
+          relativePath: second,
+          absolutePath: path.join(root, second),
+          operation: 'create',
+          description: 'A second reviewed file.',
+          rationale: null,
+          contentHash: 'c'.repeat(64),
+          binding: {},
+          documentLine: 0,
+          position: null,
+        });
+        assert.strictEqual(review.awaiting().length, 2, 'both reviews should be waiting');
+        assert.strictEqual(
+          review.findById('suite-review-1')?.relativePath,
+          target,
+          'opening a second review must not replace the first'
+        );
+
+        // Editing the file after the review opened is what makes a decision
+        // stale. The refusal must name the reason and drop the review rather
+        // than pretend the bytes are still the ones that were shown.
+        const document = active.document;
+        assert.strictEqual(document.uri.fsPath, path.resolve(absolute));
+        const edit = new vscode.WorkspaceEdit();
+        edit.insert(document.uri, new vscode.Position(1, 0), '// typed by the developer\n');
+        assert.ok(await vscode.workspace.applyEdit(edit), 'the edit should apply');
+
+        await review.decide('suite-review-1', 'approve', '');
+        assert.deepStrictEqual(
+          decisions,
+          [],
+          'a decision on changed content must not reach the workflow'
+        );
+        assert.strictEqual(
+          review.findById('suite-review-1'),
+          null,
+          'a review whose content changed should be retired, not left to refuse again'
+        );
+        // The untouched second review is unaffected by the first one's refusal.
+        assert.strictEqual(review.awaiting().length, 1, 'only the stale review should be gone');
+        assert.ok(review.findById('suite-review-2'), 'the second review should still be open');
+
+        // Close every review the way a cancelled turn does.
+        review.closeAll('cancelled');
+        assert.strictEqual(review.awaiting().length, 0, 'closing all should retire every review');
+      } finally {
+        review.dispose();
+        await closeEditorsUnder(path.join(root, ROADMAP_DIR));
+        fs.rmSync(path.join(root, ROADMAP_DIR), { recursive: true, force: true });
+      }
+    },
+  },
+
+  {
+    name: 'approving a file advances its roadmap task and offers the next one',
+    async run() {
+      const root = requireWorkspaceRoot();
+      const guard = new PathGuard(root, { allowSensitiveFiles: false });
+      const dir = path.join(root, ROADMAP_DIR);
+
+      await closeEditorsUnder(dir);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(root, ROADMAP_PATH), roadmapText());
+
+      const store = new RoadmapStore({
+        guard: () => guard,
+        workspaceRoot: () => root,
+        logger,
+      });
+
+      try {
+        const found = await store.read();
+        assert.strictEqual(found.status, 'found', 'the suite roadmap should be found');
+        if (found.status !== 'found') {
+          return;
+        }
+        assert.strictEqual(found.relativePath, ROADMAP_PATH);
+        assert.deepStrictEqual(
+          found.roadmap.tasks.map((task) => task.id),
+          ['models', 'repo'],
+          'the roadmap should parse into its two tasks'
+        );
+
+        // Write the first file for real, so the approval being simulated is an
+        // approval of something that actually exists.
+        const first = `${ROADMAP_DIR}/User.ts`;
+        await writeThroughEditor(first, '// کاربر\nexport class User {}\n', guard);
+
+        const continuation = new RoadmapContinuation({ store, logger });
+
+        // One of two files: no `done`, and the next file of the same task.
+        const afterFirst = await continuation.afterApproval({
+          relativePath: first,
+          approvedPaths: [first],
+          verified: false,
+        });
+        assert.strictEqual(afterFirst.kind, 'next_file');
+        if (afterFirst.kind === 'next_file') {
+          assert.strictEqual(afterFirst.relativePath, `${ROADMAP_DIR}/Order.ts`);
+        }
+
+        // The status edit went through a real WorkspaceEdit onto the real file.
+        const afterEdit = fs.readFileSync(path.join(root, ROADMAP_PATH), 'utf8');
+        assert.ok(
+          afterEdit.includes('### models — Domain models\n- status: in_progress'),
+          `the roadmap should record the task as started, got:\n${afterEdit}`
+        );
+        // The prose the developer wrote is still there, byte for byte.
+        assert.ok(
+          afterEdit.includes('Written by the integration suite, not by a developer.'),
+          'the status edit must not disturb the rest of the file'
+        );
+
+        // The task's files are all written, but nothing was verified: it must
+        // stay in progress rather than be marked done.
+        const second = `${ROADMAP_DIR}/Order.ts`;
+        await writeThroughEditor(second, '// سفارش\nexport class Order {}\n', guard);
+        const unverified = await continuation.afterApproval({
+          relativePath: second,
+          approvedPaths: [first, second],
+          verified: false,
+        });
+        assert.strictEqual(unverified.kind, 'awaiting_verification');
+        assert.ok(
+          !fs.readFileSync(path.join(root, ROADMAP_PATH), 'utf8').includes('- status: done'),
+          'an unverified task must never be marked done'
+        );
+
+        // Verified: the task is done, and the dependent task becomes next.
+        const verified = await continuation.afterApproval({
+          relativePath: second,
+          approvedPaths: [first, second],
+          verified: true,
+        });
+        assert.strictEqual(verified.kind, 'next_task');
+        if (verified.kind === 'next_task') {
+          assert.strictEqual(verified.taskId, 'repo');
+          assert.strictEqual(verified.relativePath, `${ROADMAP_DIR}/Repo.ts`);
+        }
+        const finalText = fs.readFileSync(path.join(root, ROADMAP_PATH), 'utf8');
+        assert.ok(
+          finalText.includes('### models — Domain models\n- status: done'),
+          `the verified task should be done, got:\n${finalText}`
+        );
+        // And nothing ahead of its dependency was started.
+        assert.ok(
+          !finalText.includes('### repo — Repository\n- status: done'),
+          'a dependent task must not be marked done'
+        );
+      } finally {
+        await closeEditorsUnder(dir);
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(path.join(root, ROADMAP_PATH), { force: true });
+      }
     },
   },
 

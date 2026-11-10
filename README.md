@@ -47,12 +47,79 @@ While a file is streaming you can:
   into a revision of *this* file.
 - **Cancel** — stop the turn and roll the file back.
 
-Each file's review is independent. Revising `create.ts` does not disturb
-`index.php`, and two sessions cannot write the same path at once.
+Before any of that, each file is a question of its own. When a proposal arrives,
+PairPilot asks **permission to write**, in a native prompt that names the file and
+what it will do, and nothing is written until you answer. The prompt opens on its
+own; dismiss it by accident and `PairPilot: Review a Waiting File…` — or the
+sidebar's button — brings it straight back. Three answers:
+
+- **Write it** creates or rewrites that one file.
+- **Request changes** sends the feedback back to the model for a revision of that
+  file, without anything touching the disk.
+- **Reject** ends the proposal. No file is created or modified.
+
+With more than one file in flight a fourth button authorises the whole set in one
+press. That is permission to write only: every file is still reviewed after it is
+written, one at a time.
+
+Once a file is written, its review opens **on that file**: a comment thread
+anchored to the top of the document, holding the explanation the proposal gave and
+the three decisions.
+
+- **Approve** keeps the file.
+- **Request changes** describes a correction; only that file is rewritten, and it
+  comes back for review again.
+- **Reject** takes the unapproved code back off disk.
+
+The same three are on the thread's menu, and `PairPilot: Review a Waiting File…`
+finds a review whose thread has scrolled out of view. The sidebar shows a review's
+*status* and a button that opens the editor — it has no way to approve anything,
+because the request protocol the panel speaks has no vocabulary for a decision.
+A panel cannot approve a file even if it wanted to.
+
+A decision is refused, with the reason named, when the content it would approve is
+no longer the content on screen: edit the file after the review opens and the
+review is retired rather than applied. Each file's session is keyed by its
+document, so revising `create.ts` does not disturb `index.php`, two sessions
+cannot write the same path at once, and switching tabs never loses a review.
 
 Nothing is ever overwritten without authorisation: an existing file is replaced
 only by an `update` proposal you approved, and a `create` over an existing file is
 refused outright.
+
+### Following a roadmap
+
+If the workspace has a `ROADMAP.md` (also `docs/ROADMAP.md` or
+`.pairpilot/ROADMAP.md`), it becomes the plan the coding turn follows. The grammar
+is meant to be written by hand:
+
+```markdown
+### models — Domain models
+- status: todo
+- files: src/User.php, src/Order.php
+- depends-on: schema
+```
+
+Each task lists the files it owns, in order, and the tasks it depends on. After you
+approve a file PairPilot updates that task's status, then offers the next file —
+the next file of the same task, or the first file of the next task whose
+dependencies are all done.
+
+Two rules keep the file honest:
+
+- **`done` requires verification.** When a task's last file is approved you are
+  asked, in a modal, whether the work passed its checks. If you have not verified
+  it, the task stays `in_progress` and no next task is started. Approved is not
+  done.
+- **Nothing is skipped.** A task is next only when every task it depends on is
+  `done`; a dependency on a task that does not exist is reported rather than
+  quietly ignored.
+
+The edit is a normal `WorkspaceEdit`, so the status change is a diff you can undo,
+and it rewrites the one `status:` line — your prose is untouched. The status is
+read fresh each turn, so editing the roadmap while PairPilot runs takes effect on
+the next file rather than after a reload.
+
 
 ### The batch record
 
@@ -140,9 +207,16 @@ context requires your explicit approval.
 
 ## AI providers and models
 
-PairPilot runs its turns on one provider at a time. **AI Providers & Models** in
-the PairPilot sidebar container manages them, and `PairPilot: Show AI Providers &
-Models` opens it.
+PairPilot runs its turns on one provider at a time. Choosing a provider or a model
+happens entirely in **native VS Code prompts** — a QuickPick for the provider, a
+searchable list for a model, a password field for a key — because a catalogue of
+hundreds of models was never going to fit in a small sidebar. The sidebar carries
+one line: the active provider and model, with a button that opens the same flow.
+
+`PairPilot: Select Provider…` switches the provider; `PairPilot: Select Model…`
+picks one for a whole workflow step or for everything (see
+[Model selection](#model-selection) below). A status-bar item shows the current
+choice and opens the picker when clicked.
 
 | Provider | Credential | Model catalogue |
 | --- | --- | --- |
@@ -160,9 +234,9 @@ Models` opens it.
    provider said — accepted, rejected, or not yet tested — along with the plan, the
    key's usage and any limit the account reports.
 
-**No key is required to look around.** `GET /models` is public, so the Model
-Explorer and the Model Advisor are fully usable before you configure anything. The
-card shows a setup state, not an error.
+**No key is required to look around.** `GET /models` is public, so the model list
+and the Model Advisor are fully usable before you configure anything. The provider
+choice reports a setup state, not an error.
 
 **Replace API key** writes a new key over the old one; **Disconnect** deletes it
 after a confirmation, and PairPilot cannot recover it afterwards.
@@ -175,9 +249,24 @@ reaches the Webview is the mask the Host computes (`sk-or-…a1b2`). Keys are ne
 written to `settings.json` or `package.json`, never logged, never included in an
 error, and never sent anywhere except the provider they belong to.
 
-### The Model Explorer
+### Choosing a model
 
-Every field on the screen comes from the catalogue. Prices are displayed **per
+`PairPilot: Select Model…` runs one hierarchical QuickPick flow, which is what
+keeps a catalogue of hundreds of models navigable in a small window:
+
+1. **Which step** — Planning, Coding, Code review, another role, the global
+   default, or a project-level choice when a folder is open.
+2. **Filters** — the quick filters below, applied inside the list.
+3. **Search** — type to filter by name, id or developer; the list only ever shows
+   what matches.
+4. **Confirm** — the choice is written at the level you picked, then the status bar
+   and sidebar update.
+
+Choosing **Automatic** at any level clears it, so it follows the level above.
+Selections persist across restarts; with nothing stored at any level the turn runs
+on the provider's own default.
+
+Every field in the list comes from the catalogue. Prices are displayed **per
 million tokens** — the convention developers read — while the stored value is per
 token; the conversion happens once, in the Host. A price the catalogue did not
 publish reads **Not provided**, never `$0.00`, which would read as free. A model
@@ -208,7 +297,7 @@ first; choosing a model in the selection screen does not add it, because a model
 picked and never tried should not outrank one that just wrote code. The
 catalogue itself is cached in `globalState` and refreshed at most every
 `pairpilot.providers.catalogRefreshHours`; a refresh that fails **keeps the models
-already loaded** and marks them out of date rather than emptying the Explorer.
+already loaded** and marks them out of date rather than emptying the list.
 
 ### The Model Advisor
 
@@ -284,7 +373,7 @@ changes nothing at the provider.
 - A working **Claude Code CLI** on your `PATH`, already configured with your model
   and credentials. PairPilot shells out to it and never handles keys itself.
   OpenRouter is optional: without it, everything except remote-provider turns
-  still works, including the Model Explorer and the Model Advisor.
+  still works, including the model list and the Model Advisor.
 
 Verify the connection at any time with **PairPilot: Check AI Runtime**.
 
@@ -299,7 +388,16 @@ Verify the connection at any time with **PairPilot: Check AI Runtime**.
 | `PairPilot: Revert Last Unapproved Write` | Undo the most recent approved write |
 | `PairPilot: Show Token Usage` | Session token and cost totals |
 | `PairPilot: Check AI Runtime` | Verify the CLI is reachable |
-| `PairPilot: Show AI Providers & Models` | Open the provider and model manager |
+| `PairPilot: Select Provider…` | Choose the active provider |
+| `PairPilot: Select Model…` | Choose a model for a step, or the global default |
+| `PairPilot: Select Global Model…` | Choose the model every turn falls back to |
+| `PairPilot: Select Planning Model…` | Choose the model for planning turns |
+| `PairPilot: Select Coding Model…` | Choose the model for coding turns |
+| `PairPilot: Select Review Model…` | Choose the model for review and advice |
+| `PairPilot: Review a Waiting File…` | Raise the prompt that is waiting — permission to write, or a written file's review |
+| `PairPilot: Approve Review` | Approve the review for the active file (thread menu) |
+| `PairPilot: Reject Review` | Reject it, removing the unapproved code (thread menu) |
+| `PairPilot: Request Changes to Review` | Describe a correction for it (thread menu) |
 | `PairPilot: Show Cost & Usage` | Open the cost dashboard |
 | `PairPilot: Set or Replace Provider API Key…` | Store or replace an OpenRouter key |
 | `PairPilot: Test Provider Connection` | Validate the stored key against the provider |

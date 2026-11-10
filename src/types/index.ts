@@ -77,6 +77,11 @@ export const STATE_TRANSITIONS: Readonly<Record<PairPilotState, readonly PairPil
   ],
   [PairPilotState.WAITING_FILE_APPROVAL]: [
     PairPilotState.CREATING_FILE,
+    // "Not this code" answered at the permission gate. The developer asked for a
+    // revision before anything was written, so the turn goes to the same
+    // revision path a written file takes — without a rollback, because there is
+    // nothing on disk to roll back.
+    PairPilotState.REQUESTING_CHANGES,
     PairPilotState.REJECTED,
     PairPilotState.CANCELLED,
     PairPilotState.FAILED,
@@ -530,12 +535,20 @@ export type WebviewRequest =
   | { type: 'ready' }
   | { type: 'submitTask'; text: string }
   | { type: 'cancel' }
+  // No decision message appears here, deliberately.
+  //
+  // Approve, Reject and Request changes arrive from the editor — a comment
+  // thread on the file, or a native prompt — and are dispatched by the review
+  // commands. With no approval type in this union there is no Webview message a
+  // compromised or stale panel could send to act on a file, which is the
+  // strongest form of the "treat Webview messages as untrusted" requirement:
+  // the channel simply has no vocabulary for a decision.
   /**
    * Hold and release the stream into the editor while a file is being written.
    *
-   * Separate from `cancel`: pausing keeps the turn and the partial write, so the
-   * developer can read what has arrived and then either let it continue or ask
-   * for it to be different.
+   * A streaming control, not an approval: pausing keeps the turn and the partial
+   * write so the developer can read what has arrived. The spec asks for pause,
+   * resume and cancel during streaming, and the composer is where those belong.
    */
   | { type: 'pauseWrite' }
   | { type: 'resumeWrite' }
@@ -544,17 +557,27 @@ export type WebviewRequest =
    *
    * The mid-stream counterpart of `requestChanges`: the partial content is taken
    * back off disk and the feedback becomes a revision request for the same file.
+   * It is a *revision request*, not an approval — nothing is kept by it.
    */
   | { type: 'requestChangesDuringWrite'; feedback: string }
-  | ({ type: 'approveFileCreation'; contentHash: string } & DecisionBindingFields)
-  | ({ type: 'rejectFileCreation'; contentHash: string } & DecisionBindingFields)
-  | ({ type: 'approveCode'; contentHash: string } & DecisionBindingFields)
-  | ({ type: 'rejectCode'; contentHash: string } & DecisionBindingFields)
-  | ({
-      type: 'requestChanges';
-      contentHash: string;
-      feedback: string;
-    } & DecisionBindingFields)
+  | { type: 'openReviewInEditor' }
+  /**
+   * Start the file the roadmap offered.
+   *
+   * Carries no path on purpose: the host reads the offer it made from its own
+   * state. A path from the Webview would be an arbitrary file path chosen by
+   * untrusted input, and an offer whose target the panel can name is not an
+   * offer — it is a request to write whatever it likes.
+   */
+  | { type: 'continueRoadmap' }
+  /**
+   * Open the native provider/model picker.
+   *
+   * A navigation request carrying nothing: which level to configure is the
+   * developer's choice in the QuickPick, never the panel's. Opens exactly the
+   * flow the Command Palette entry does.
+   */
+  | { type: 'chooseModel' }
   | { type: 'acceptRecommendation' }
   | { type: 'dismissRecommendation' }
   | { type: 'newSession' }
@@ -640,6 +663,23 @@ export interface WebviewStateSnapshot {
   /** Files included in the most recent request, for transparency. */
   lastContextFiles: ContextFileSummary[];
   recommendation: AdvisorRecommendation | null;
+  /**
+   * The next file the project's roadmap says to write, if one does.
+   *
+   * An offer, not a queued turn: the panel shows a "Write it" action, and
+   * starting that turn is the developer's click. Null when there is no roadmap,
+   * no eligible task, or the batch has not settled.
+   */
+  roadmap: { relativePath: string; taskId: string } | null;
+  /**
+   * A one-line summary of the provider and model in force.
+   *
+   * Compact on purpose: the panel is not where either is chosen any more. It
+   * says what will run the next turn, and the action opens the same native flow
+   * the Command Palette does, so there is exactly one way to configure a model
+   * and one place it is rendered.
+   */
+  modelConfig: { providerLabel: string; modelLabel: string } | null;
   sessions: SessionSummary[];
   error: string | null;
   notice: string | null;
@@ -692,7 +732,6 @@ export interface SessionSummary {
 export type HostMessage =
   | { type: 'state'; snapshot: WebviewStateSnapshot }
   | { type: 'textDelta'; text: string }
-  | { type: 'codeDelta'; blockIndex: number; text: string }
   | { type: 'writingProgress'; written: number; total: number; relativePath: string }
   | { type: 'toast'; level: 'info' | 'warn' | 'error'; message: string };
 

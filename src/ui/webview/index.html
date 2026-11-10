@@ -43,6 +43,13 @@
         <span id="mode-label" class="mode-label">Discovery</span>
         <span id="mode-summary" class="mode-summary"></span>
       </div>
+      <!--
+        The provider and model, in one line. Deliberately not an editor: there
+        are hundreds of models, and choosing one by scrolling a sidebar is the
+        problem the native QuickPick flow exists to solve. This says what will
+        run the next turn and opens that flow.
+      -->
+      <div id="model-bar" class="model-bar"></div>
     </header>
 
     <!-- -------------------------------------------------------------- tabs -->

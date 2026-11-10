@@ -1,5 +1,5 @@
 /**
- * The two management panels, as files (spec sections 6 and 14).
+ * The shipped Webview panels, as files (spec sections 6 and 14).
  *
  * Everything in `src/ui/webview/` is shipped into a Webview, where the model
  * catalogue — remote, third-party text — is rendered. These tests pin the
@@ -38,8 +38,15 @@ const EXPECTED_PLACEHOLDERS = [
   'styleUri',
 ];
 
+/**
+ * Every panel that is actually loaded, and only those.
+ *
+ * The providers panel used to be here. Provider and model choice now happen in
+ * native prompts, so `providers.*` no longer ships — and a hygiene test over a
+ * file nothing loads proves something about a page the developer can never
+ * reach. The cost panel is the one Webview left.
+ */
 const PANELS = [
-  { name: 'providers', template: 'providers.html', script: 'providers.js', style: 'providers.css' },
   { name: 'cost', template: 'cost.html', script: 'cost.js', style: 'cost.css' },
 ];
 

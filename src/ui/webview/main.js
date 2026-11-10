@@ -114,6 +114,7 @@
       return;
     }
     renderHeader();
+    renderModelBar();
     renderTabs();
     renderNoticeBoxes();
     renderChat();
@@ -124,6 +125,38 @@
     renderSessions();
     renderUsage();
     renderComposer();
+  }
+
+
+  /**
+   * Provider and model, in one line, with the one action that matters.
+   *
+   * Read-only apart from the button: the panel does not choose a model, it opens
+   * the native picker. That keeps a single configuration surface, and means the
+   * Webview never holds a model id it could send back as a selection.
+   */
+  function renderModelBar() {
+    const container = el('model-bar');
+    container.textContent = '';
+
+    const config = snapshot.modelConfig;
+    if (!config) {
+      return;
+    }
+
+    const text = document.createElement('span');
+    text.className = 'model-bar-text';
+    // Built with textContent, never innerHTML: the model name comes from a remote
+    // catalogue and is not this panel's to trust.
+    text.textContent = config.providerLabel + ' · ' + config.modelLabel;
+    container.appendChild(text);
+
+    const change = document.createElement('button');
+    change.className = 'link';
+    change.textContent = 'Change';
+    change.title = 'Choose the provider or model in a VS Code picker';
+    change.addEventListener('click', () => post({ type: 'chooseModel' }));
+    container.appendChild(change);
   }
 
   function renderHeader() {
@@ -339,39 +372,85 @@
     container.appendChild(card);
   }
 
+  /**
+   * The Review tab is a *status* view now, not a decision surface.
+   *
+   * The decision happens in the editor that holds the code: a comment thread on
+   * the file, a native prompt with the three buttons. Putting the buttons here
+   * as well would be the panel-based review this was changed to remove — and
+   * two places to approve from is two places to make one mistake in.
+   *
+   * So this shows which file is waiting, how far into the batch it is, and a
+   * link that brings the editor's own review to the front. Nothing in it can
+   * change what the workflow will do.
+   */
   function renderReview() {
     const container = el('review-content');
     container.textContent = '';
 
-    // The batch always comes first when there is one, so the developer can see
-    // all seven files, what state each is in, and jump to any of them. This is
-    // the "each file's review is independent" requirement made visible: the list
-    // is drawn from the host's record, not from what this panel has watched
-    // happen, so it survives a reload intact.
     if (snapshot.batch && snapshot.batch.total > 1) {
       container.appendChild(buildBatchPanel(snapshot.batch));
     }
 
-    // Stage 1: permission to create or update the file. Nothing exists yet for
-    // a create, so this gate is about the path, not the content.
-    if (snapshot.state === 'WAITING_FILE_APPROVAL' && snapshot.pendingFilePath) {
-      container.appendChild(buildFileApprovalGate());
-      return;
-    }
-
     const proposal = snapshot.activeProposal;
-    if (!proposal) {
+    const waiting =
+      snapshot.state === 'WAITING_FILE_APPROVAL' ||
+      snapshot.state === 'WAITING_CODE_APPROVAL' ||
+      snapshot.state === 'REVIEWING';
+
+    if (!waiting && !proposal) {
       if (snapshot.batch && snapshot.batch.total > 1) {
         return;
       }
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.textContent = 'No code proposal is awaiting review.';
+      empty.textContent = 'Nothing is waiting for review.';
       container.appendChild(empty);
       return;
     }
 
-    container.appendChild(buildReviewCard(proposal));
+    const card = document.createElement('div');
+    card.className = 'card';
+
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    const name = document.createElement('span');
+    name.textContent = proposal ? proposal.relativePath : snapshot.pendingFilePath || '';
+    name.setAttribute('dir', 'ltr');
+    title.appendChild(name);
+    card.appendChild(title);
+
+    const where = document.createElement('div');
+    where.className = 'body-text';
+    const askingToWrite = snapshot.state === 'WAITING_FILE_APPROVAL';
+    where.textContent = askingToWrite
+      ? 'PairPilot is asking for permission to write this file. Nothing has been written yet — answer in the prompt that opened.'
+      : 'The code is written. Review it in the editor, on the file itself.';
+    card.appendChild(where);
+
+    if (proposal && proposal.description) {
+      const desc = document.createElement('div');
+      desc.className = 'hint';
+      desc.textContent = proposal.description;
+      applyDirection(desc, proposal.description);
+      card.appendChild(desc);
+    }
+
+    const open = document.createElement('button');
+    open.textContent = askingToWrite ? 'Show the permission prompt' : 'Open the review in the editor';
+    open.addEventListener('click', () => {
+      post({ type: 'openReviewInEditor' });
+    });
+    card.appendChild(open);
+
+    const note = document.createElement('div');
+    note.className = 'hint';
+    note.textContent = askingToWrite
+      ? 'The decision belongs to the file: PairPilot asks before it writes, then shows the written code in the editor for approval.'
+      : 'Approve, Request changes and Reject are on the file\'s comment thread and in the Command Palette, so the decision is made where the code is.';
+    card.appendChild(note);
+
+    container.appendChild(card);
   }
 
   /** Human wording and a css class for each batch file state. */
@@ -452,310 +531,20 @@
     return card;
   }
 
-  function buildFileApprovalGate() {
-    const gate = document.createElement('div');
-    gate.className = 'approval-gate';
-
-    const heading = document.createElement('h3');
-    heading.textContent =
-      snapshot.pendingFileOperation === 'update'
-        ? 'Permission to update a file'
-        : 'Permission to create a file';
-    gate.appendChild(heading);
-
-    const pathLine = document.createElement('div');
-    pathLine.className = 'card-sub';
-    pathLine.textContent = snapshot.pendingFilePath;
-    pathLine.setAttribute('dir', 'ltr');
-    gate.appendChild(pathLine);
-
-    const explanation = document.createElement('div');
-    explanation.className = 'hint';
-    explanation.textContent =
-      snapshot.pendingFileOperation === 'update'
-        ? 'PairPilot will show you a diff against the current content before anything changes on disk.'
-        : 'PairPilot will create this file empty, write the proposed code into your editor, and then ask you to review it. If you reject the code, the file is removed again.';
-    gate.appendChild(explanation);
-
-    // A multi-file proposal repeats this gate per file, so the panel says which
-    // one this is and what is still to come. Without that, "change 3" would look
-    // like an unexplained new request.
-    const progress = changeProgress();
-    if (progress) {
-      const position = document.createElement('div');
-      position.className = 'hint';
-      position.textContent =
-        'This proposal writes ' +
-        progress.total +
-        ' files. You are being asked about file ' +
-        progress.index +
-        '. Each file is still shown for review as it is written.';
-      gate.appendChild(position);
-
-      const plan = document.createElement('ol');
-      plan.className = 'change-plan';
-      plan.setAttribute('dir', 'ltr');
-      for (let i = 0; i < snapshot.changePlan.length; i++) {
-        const entry = snapshot.changePlan[i];
-        const item = document.createElement('li');
-        // Every field is model-supplied text, so it goes in with textContent.
-        item.textContent = entry.operation + ' ' + entry.file;
-        if (i + 1 < progress.index) {
-          item.className = 'done';
-        } else if (i + 1 === progress.index) {
-          item.className = 'current';
-        }
-        plan.appendChild(item);
-      }
-      gate.appendChild(plan);
-    }
-
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-
-    const approve = document.createElement('button');
-    approve.textContent =
-      progress && progress.total > 1
-        ? 'Allow this file'
-        : snapshot.pendingFileOperation === 'update'
-          ? 'Allow update'
-          : 'Allow creation';
-    approve.addEventListener('click', () => {
-      post(decision('approveFileCreation'));
-    });
-    actions.appendChild(approve);
-
-    // Approving the set is offered only when there is a set, and it approves the
-    // same object the host holds — the set hash — so the host can verify it
-    // against live state exactly as it verifies a single file.
-    if (progress && progress.total > progress.index) {
-      const remaining = progress.total - progress.index;
-      const approveAll = document.createElement('button');
-      approveAll.className = 'secondary';
-      approveAll.textContent =
-        'Allow all ' + remaining + ' remaining file' + (remaining === 1 ? '' : 's');
-      approveAll.addEventListener('click', () => {
-        // The set hash, not a file hash: this authorises the remaining files by
-        // identity, and the version it echoes is the one on screen. The host
-        // authorises *writing*; each file is still reviewed afterwards.
-        post(
-          Object.assign(
-            { type: 'approveFileCreation', contentHash: progress.setId },
-            binding()
-          )
-        );
-      });
-      actions.appendChild(approveAll);
-    }
-
-    const reject = document.createElement('button');
-    reject.className = 'secondary';
-    reject.textContent = 'Decline';
-    reject.addEventListener('click', () => {
-      post(decision('rejectFileCreation'));
-    });
-    actions.appendChild(reject);
-
-    gate.appendChild(actions);
-    return gate;
-  }
-
-  /** The change-set position, or null for a single-file proposal. */
-  function changeProgress() {
-    if (!snapshot || !snapshot.changeProgress) {
-      return null;
-    }
-    const progress = snapshot.changeProgress;
-    if (!progress.total || progress.total < 2) {
-      return null;
-    }
-    return progress;
-  }
-
-  /**
-   * The content hash to echo back with a decision.
-   *
-   * The host verifies this against the live proposal, so a stale panel cannot
-   * approve something the developer never saw.
-   */
-  function currentHash() {
-    return (snapshot && snapshot.activeProposal && snapshot.activeProposal.contentHash) || '';
-  }
-
-  /**
-   * The identity to echo back with a decision.
-   *
-   * The hash answers *what bytes*; this answers *which file, in which version of
-   * which proposal*. Both go with every decision so the host can refuse one that
-   * has gone stale in either sense, and can tell which of seven files it applies
-   * to. A missing binding is sent as nothing rather than as empty strings, so the
-   * host sees "no claim" and not "a claim about an empty id".
-   */
-  function binding() {
-    const b = snapshot && snapshot.reviewBinding;
-    if (!b) {
-      return {};
-    }
-    return { proposalId: b.proposalId, proposalVersion: b.proposalVersion, fileId: b.fileId };
-  }
-
-  /** One decision message: hash + identity, always together. */
-  function decision(type, extra) {
-    return Object.assign({ type: type, contentHash: currentHash() }, binding(), extra || {});
-  }
-
-  function buildReviewCard(proposal) {
-    const card = document.createElement('div');
-    card.className = 'card';
-
-    const title = document.createElement('div');
-    title.className = 'card-title';
-    const name = document.createElement('span');
-    name.textContent = proposal.relativePath;
-    name.setAttribute('dir', 'ltr');
-    title.appendChild(name);
-    const op = document.createElement('span');
-    op.className = 'state-pill';
-    op.textContent = proposal.operation;
-    title.appendChild(op);
-    card.appendChild(title);
-
-    const desc = document.createElement('div');
-    desc.className = 'body-text';
-    desc.textContent = proposal.description;
-    applyDirection(desc, proposal.description);
-    card.appendChild(desc);
-
-    const openButton = document.createElement('button');
-    openButton.className = 'link';
-    openButton.textContent = 'Open the file in the editor';
-    openButton.addEventListener('click', () => {
-      post({ type: 'openFile', relativePath: proposal.relativePath });
-    });
-    card.appendChild(openButton);
-
-    if (proposal.rationale) {
-      card.appendChild(sectionTitle('Why this implementation'));
-      const body = document.createElement('div');
-      body.className = 'body-text';
-      body.textContent = proposal.rationale;
-      applyDirection(body, proposal.rationale);
-      card.appendChild(body);
-    }
-
-    if (proposal.responsibilities && proposal.responsibilities.length > 0) {
-      card.appendChild(sectionTitle('Responsibilities'));
-      card.appendChild(bulletList(proposal.responsibilities));
-    }
-
-    if (proposal.dependencies && proposal.dependencies.length > 0) {
-      card.appendChild(sectionTitle('Dependencies'));
-      card.appendChild(bulletList(proposal.dependencies, true));
-    }
-
-    if (proposal.potentialProblems && proposal.potentialProblems.length > 0) {
-      card.appendChild(sectionTitle('Potential problems'));
-      const box = document.createElement('div');
-      box.className = 'warning-box';
-      const list = document.createElement('ul');
-      list.className = 'tight';
-      for (const item of proposal.potentialProblems) {
-        const li = document.createElement('li');
-        li.textContent = item;
-        applyDirection(li, item);
-        list.appendChild(li);
-      }
-      box.appendChild(list);
-      card.appendChild(box);
-    }
-
-    card.appendChild(sectionTitle('Code'));
-    for (const block of proposal.blocks) {
-      const label = document.createElement('div');
-      label.className = 'card-sub';
-      label.textContent = `${block.id} · ${block.type}${block.description ? ' · ' + block.description : ''}`;
-      card.appendChild(label);
-      const pre = document.createElement('pre');
-      pre.className = 'code';
-      pre.textContent = block.code;
-      card.appendChild(pre);
-    }
-
-    if (proposal.nextStep) {
-      card.appendChild(sectionTitle('Suggested next step'));
-      const next = document.createElement('div');
-      next.className = 'hint';
-      next.textContent = `${proposal.nextStep.title} — ${proposal.nextStep.reason}`;
-      applyDirection(next, next.textContent);
-      card.appendChild(next);
-    }
-
-    card.appendChild(buildReviewActions(proposal));
-    return card;
-  }
-
-  function buildReviewActions(proposal) {
-    const section = document.createElement('div');
-
-    const feedbackLabel = document.createElement('div');
-    feedbackLabel.className = 'section-title';
-    feedbackLabel.textContent = 'Feedback for a revision';
-    section.appendChild(feedbackLabel);
-
-    const textarea = document.createElement('textarea');
-    textarea.rows = 3;
-    textarea.placeholder = 'Describe what should change…';
-    textarea.value = drafts.feedback;
-    textarea.addEventListener('input', () => {
-      drafts.feedback = textarea.value;
-    });
-    applyDirection(textarea, textarea.value);
-    section.appendChild(textarea);
-
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-
-    const approve = document.createElement('button');
-    approve.textContent = 'Approve';
-    approve.addEventListener('click', () => {
-      post(decision('approveCode'));
-    });
-    actions.appendChild(approve);
-
-    const reject = document.createElement('button');
-    reject.className = 'danger';
-    reject.textContent = 'Reject';
-    reject.addEventListener('click', () => {
-      post(decision('rejectCode'));
-    });
-    actions.appendChild(reject);
-
-    const revise = document.createElement('button');
-    revise.className = 'secondary';
-    revise.textContent = 'Request changes';
-    revise.addEventListener('click', () => {
-      if (drafts.feedback.trim().length === 0) {
-        window.alert('Describe the changes you want before requesting a revision.');
-        return;
-      }
-      post(
-        decision('requestChanges', {
-          contentHash: proposal.contentHash,
-          feedback: drafts.feedback,
-        })
-      );
-      drafts.feedback = '';
-    });
-    actions.appendChild(revise);
-
-    section.appendChild(actions);
-    return section;
-  }
-
   function renderAdvisor() {
     const container = el('advisor-content');
     container.textContent = '';
     const rec = snapshot.recommendation;
+    const roadmap = snapshot.roadmap;
+
+    // The roadmap offer is shown whether or not the advisor has a suggestion:
+    // the plan the developer wrote outranks a model's guess at what comes next,
+    // and a panel that hid the planned next file behind an optional advisor
+    // recommendation would be offering advice instead of the roadmap.
+    if (roadmap) {
+      container.appendChild(buildRoadmapCard(roadmap));
+    }
+
     if (!rec) {
       return;
     }
@@ -814,6 +603,50 @@
 
     card.appendChild(actions);
     container.appendChild(card);
+  }
+
+  /**
+   * The next file the roadmap says to write.
+   *
+   * A single button, and it carries no path: the host starts the file it
+   * offered. That is what keeps this a *read-only status view with a
+   * navigation action* rather than a place where a file is chosen.
+   */
+  function buildRoadmapCard(roadmap) {
+    const card = document.createElement('div');
+    card.className = 'card';
+
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    title.textContent = 'Next on the roadmap';
+    card.appendChild(title);
+
+    const file = document.createElement('div');
+    file.className = 'body-text';
+    const path = document.createElement('code');
+    path.textContent = roadmap.relativePath;
+    file.appendChild(path);
+    if (roadmap.taskId) {
+      file.appendChild(document.createTextNode(` — task ${roadmap.taskId}`));
+    }
+    card.appendChild(file);
+
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent =
+      'Written into the file itself, then kept only when you approve it in the editor.';
+    card.appendChild(hint);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+
+    const write = document.createElement('button');
+    write.textContent = 'Write this file';
+    write.addEventListener('click', () => post({ type: 'continueRoadmap' }));
+    actions.appendChild(write);
+
+    card.appendChild(actions);
+    return card;
   }
 
   function renderSessions() {
@@ -1085,17 +918,6 @@
         if (snapshot) {
           snapshot.isStreaming = true;
           renderChat();
-        }
-        break;
-
-      case 'codeDelta':
-        if (snapshot) {
-          if (!snapshot.streamingCode) {
-            snapshot.streamingCode = [];
-          }
-          snapshot.streamingCode[message.blockIndex] =
-            (snapshot.streamingCode[message.blockIndex] || '') + message.text;
-          renderTaskStatus();
         }
         break;
 

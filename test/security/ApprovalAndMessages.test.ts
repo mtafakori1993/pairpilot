@@ -209,21 +209,38 @@ describe('MessageValidator: accepted messages', () => {
     expect(result).toEqual({ type: 'submitTask', text: 'build me a thing' });
   });
 
-  it('accepts a decision carrying a valid hash', () => {
-    const hash = 'a'.repeat(64);
-    expect(messageValidator.validate({ type: 'approveCode', contentHash: hash })).toEqual({
-      type: 'approveCode',
-      contentHash: hash,
+  it('accepts the streaming controls the composer offers', () => {
+    expect(messageValidator.validate({ type: 'pauseWrite' })).toEqual({ type: 'pauseWrite' });
+    expect(messageValidator.validate({ type: 'resumeWrite' })).toEqual({ type: 'resumeWrite' });
+    expect(
+      messageValidator.validate({ type: 'requestChangesDuringWrite', feedback: 'write it shorter' })
+    ).toEqual({ type: 'requestChangesDuringWrite', feedback: 'write it shorter' });
+  });
+
+  it('accepts the request to open the editor review', () => {
+    expect(messageValidator.validate({ type: 'openReviewInEditor' })).toEqual({
+      type: 'openReviewInEditor',
     });
   });
 
-  it('accepts requestChanges with feedback', () => {
-    const result = messageValidator.validate({
-      type: 'requestChanges',
-      contentHash: 'b'.repeat(64),
-      feedback: 'please rename it',
-    });
-    expect(result).toMatchObject({ type: 'requestChanges', feedback: 'please rename it' });
+  it('accepts "choose a model" and carries nothing up with it', () => {
+    // Which level to configure is chosen in the QuickPick. A level from the
+    // panel would be a settings write chosen by untrusted input.
+    expect(
+      messageValidator.validate({ type: 'chooseModel', level: 'role', key: 'coding' })
+    ).toEqual({ type: 'chooseModel' });
+  });
+
+  it('accepts "continue the roadmap" but strips any path the panel sends with it', () => {
+    // The host starts the file it offered, not a path the Webview supplied. A
+    // path here would be untrusted input choosing what PairPilot writes.
+    expect(
+      messageValidator.validate({
+        type: 'continueRoadmap',
+        relativePath: '../../etc/passwd',
+        path: '/etc/shadow',
+      })
+    ).toEqual({ type: 'continueRoadmap' });
   });
 });
 
@@ -250,16 +267,21 @@ describe('MessageValidator: shape enforcement', () => {
     expect(() => messageValidator.validate(payload)).toThrow(/forbidden key/i);
   });
 
-  it('rejects a malformed hash, so a decision cannot be forged', () => {
-    expect(() => messageValidator.validate({ type: 'approveCode', contentHash: 'nope' })).toThrow(
-      /SHA-256/i
-    );
-    expect(() =>
-      messageValidator.validate({ type: 'approveCode', contentHash: 'A'.repeat(64) })
-    ).toThrow(/lowercase/i);
-    expect(() =>
-      messageValidator.validate({ type: 'approveCode', contentHash: 'a'.repeat(63) })
-    ).toThrow(/SHA-256/i);
+  it('has no vocabulary for a decision, so no Webview message can approve anything', () => {
+    // This is the structural guarantee behind "treat Webview messages as
+    // untrusted input": the channel cannot carry a decision, forged or
+    // otherwise, because no such message type exists.
+    for (const type of [
+      'approveCode',
+      'rejectCode',
+      'requestChanges',
+      'approveFileCreation',
+      'rejectFileCreation',
+    ]) {
+      expect(() =>
+        messageValidator.validate({ type, contentHash: 'a'.repeat(64), feedback: 'x' })
+      ).toThrow(/Unsupported message type/i);
+    }
   });
 
   it('rejects a blank task', () => {

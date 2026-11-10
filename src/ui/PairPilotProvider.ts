@@ -48,6 +48,14 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
        * in use.
        */
       runtimeStatus: () => RuntimeStatus;
+      /**
+       * The provider and model that will run the next turn, in one line.
+       *
+       * Resolved in the host, because which model a turn uses depends on the
+       * role and the project — facts the panel has no way to know and must not
+       * be asked to infer.
+       */
+      modelConfig: () => { providerLabel: string; modelLabel: string } | null;
       workspace: WorkspaceContext | (() => WorkspaceContext | null);
       logger: { info(m: string): void; warn(m: string): void; error(m: string, e?: unknown): void };
       onMessage(raw: unknown): void | Promise<void>;
@@ -92,10 +100,6 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
 
   postTextDelta(text: string): void {
     this.post({ type: 'textDelta', text });
-  }
-
-  postCodeDelta(blockIndex: number, text: string): void {
-    this.post({ type: 'codeDelta', blockIndex, text });
   }
 
   postWritingProgress(written: number, total: number, relativePath: string): void {
@@ -179,6 +183,8 @@ export class PairPilotProvider implements vscode.WebviewViewProvider {
       pinnedContext: orchestrator.pinnedContextValue,
       lastContextFiles: orchestrator.lastContextFilesValue,
       recommendation: orchestrator.recommendationValue,
+      roadmap: orchestrator.offeredRoadmapFile,
+      modelConfig: this.deps.modelConfig(),
       sessions: this.deps.store.list(),
       error: orchestrator.errorValue,
       notice: orchestrator.noticeValue,

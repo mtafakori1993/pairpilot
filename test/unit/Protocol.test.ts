@@ -1305,3 +1305,194 @@ describe('a corrected retry', () => {
     expect(interpretTurn(JSON.stringify(fixed)).kind).toBe('proposal');
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* The contract failure on "make simple x.html for test agent"                 */
+/*                                                                            */
+/* The developer asked for a file; the model answered with a description of    */
+/* the file in `message` and no `changes` array. The refusal was correct —     */
+/* what was wrong was everything around it: shapes carrying the real code     */
+/* one level down were refused alongside it, the prompt offered a type menu    */
+/* where a build instruction needed a demand, and a reply pairing a summary  */
+/* with the actual proposal lost the proposal to scan order. These tests pin   */
+/* each half: the summary-only reply must stay refused, and every shape that   */
+/* does carry content must come through with its bytes intact.                 */
+/* -------------------------------------------------------------------------- */
+
+describe('the summary-without-changes contract failure', () => {
+  /** The complete file the developer asked for and the model wrote. */
+  const FULL_HTML =
+    '<!DOCTYPE html>\n<html>\n<head><meta charset="utf-8"><title>Agent test</title></head>\n<body><h1>Test agent page</h1></body>\n</html>\n';
+  /** One complete, valid change for x.html. */
+  const change = {
+    file: 'x.html',
+    operation: 'create',
+    description: 'A simple page the test agent loads.',
+    content: FULL_HTML,
+  };
+  /** The summary-shaped reply that produced the reported error. */
+  const summaryEcho = JSON.stringify({
+    type: 'code_proposal',
+    message: 'Creates a simple x.html page for the test agent to load and verify.',
+  });
+
+  it('refuses a description of the file in place of the file itself', () => {
+    const outcome = parseProtocol(summaryEcho);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.kind).toBe('schema');
+      expect(outcome.issues[0]!.path).toBe('/changes');
+      expect(outcome.issues[0]!.code).toBe('missing_field');
+      expect(outcome.issues[0]!.message).toContain('non-empty "changes"');
+    }
+  });
+
+  it('refuses an empty changes array the same way, with the empty_value code', () => {
+    const outcome = parseProtocol(
+      JSON.stringify({ type: 'code_proposal', message: 'Creating the page.', changes: [] })
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues[0]!.code).toBe('empty_value');
+    }
+  });
+
+  it('reads the real proposal when a summary-shaped object precedes it', () => {
+    // The shape of the reported interaction: the model narrates first, then
+    // delivers. The first JSON object is a valid object of the wrong shape;
+    // until the scan-order fix, parsing stopped there and the file content
+    // later in the reply was never read.
+    const reply = [
+      'Here is the summary:',
+      '```json',
+      summaryEcho,
+      '```',
+      '',
+      'The proposal:',
+      JSON.stringify({ type: 'code_proposal', message: 'Creating the page.', changes: [change] }),
+    ].join('\n');
+    const outcome = parseProtocol(reply);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      const message = outcome.message as import('../../src/protocol/types').CodeProposalMessage;
+      expect(message.type).toBe('code_proposal');
+      expect(message.changes).toHaveLength(1);
+      expect(message.changes[0]!.content).toBe(FULL_HTML);
+    }
+  });
+
+  it('lifts a nested payload even when an empty root changes array occupies the key', () => {
+    const reply = JSON.stringify({
+      type: 'code_proposal',
+      message: 'Creates a simple x.html page for the test agent.',
+      changes: [],
+      proposal: { changes: [change] },
+    });
+    const outcome = parseProtocol(reply);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      const message = outcome.message as import('../../src/protocol/types').CodeProposalMessage;
+      expect(message.changes[0]!.content).toBe(FULL_HTML);
+    }
+  });
+
+  it('reads a changes value sent as a single object as a one-change array', () => {
+    const outcome = parseProtocol(
+      JSON.stringify({ type: 'code_proposal', message: 'm', changes: change })
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      const message = outcome.message as import('../../src/protocol/types').CodeProposalMessage;
+      expect(message.changes).toHaveLength(1);
+      expect(message.changes[0]!.content).toBe(FULL_HTML);
+    }
+  });
+
+  it('reads a bare change that spells its operation in "type"', () => {
+    const outcome = parseProtocol(
+      JSON.stringify({ file: 'x.html', type: 'create', description: 'd', content: FULL_HTML })
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      const message = outcome.message as import('../../src/protocol/types').CodeProposalMessage;
+      expect(message.changes[0]!.operation).toBe('create');
+      expect(message.changes[0]!.content).toBe(FULL_HTML);
+    }
+  });
+
+  it('still refuses a fragment of a rejected whole document', () => {
+    // A whole document was parsed and refused (its change has no content).
+    // Nothing inside it may then validate on its own: the inner change object
+    // is not an independent message, it is part of what was refused. This is
+    // the safety property the two-tier design protects — a proposal rejected
+    // as a set must not have one file quietly salvaged out of it.
+    const broken = JSON.stringify({
+      type: 'code_proposal',
+      message: 'm',
+      changes: [{ file: 'x.html', operation: 'create', description: 'd' }],
+    });
+    const outcome = parseProtocol(broken);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.some((issue) => issue.code === 'missing_field')).toBe(true);
+    }
+  });
+
+  it('still refuses content nested two levels under the change, and names the field', () => {
+    const outcome = parseProtocol(
+      JSON.stringify({
+        type: 'code_proposal',
+        message: 'm',
+        changes: [{ file: 'x.html', operation: 'create', description: 'd', create: { content: FULL_HTML } }],
+      })
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues[0]!.path).toBe('/changes/0/content');
+    }
+  });
+
+  it('renders the summary line the developer saw for a valid proposal', () => {
+    const outcome = parseProtocol(
+      JSON.stringify({ type: 'code_proposal', message: 'Creating the page.', changes: [change] })
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      const text = renderMessage(outcome.message);
+      expect(text).toContain('1 to create, 0 to update.');
+    }
+  });
+
+  it('handles PHP, CSS, JS and multi-file proposals with their bytes intact', () => {
+    const multi = JSON.stringify({
+      type: 'code_proposal',
+      message: 'A small page with its stylesheet and script.',
+      changes: [
+        { file: 'page.php', operation: 'create', description: 'PHP entry point.', content: '<?php\necho "hi";\n' },
+        { file: 'style.css', operation: 'create', description: 'Styles.', content: 'body { margin: 0; }\n' },
+        { file: 'app.js', operation: 'create', description: 'Script.', content: 'console.log("hi");\n' },
+        { file: 'x.html', operation: 'create', description: 'The page.', content: FULL_HTML },
+      ],
+    });
+    const outcome = parseProtocol(multi);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      const message = outcome.message as import('../../src/protocol/types').CodeProposalMessage;
+      expect(message.changes).toHaveLength(4);
+      expect(message.changes[0]!.content).toBe('<?php\necho "hi";\n');
+      expect(message.changes[1]!.content).toBe('body { margin: 0; }\n');
+      expect(message.changes[2]!.content).toBe('console.log("hi");\n');
+      expect(message.changes[3]!.content).toBe(FULL_HTML);
+    }
+  });
+
+  it('does not coerce a chat_response that mentions a file into a proposal', () => {
+    const outcome = parseProtocol(
+      JSON.stringify({ type: 'chat_response', message: 'You asked me to make x.html earlier.' })
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.message.type).toBe('chat_response');
+    }
+  });
+});

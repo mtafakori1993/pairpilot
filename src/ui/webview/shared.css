@@ -1,5 +1,5 @@
 /*
- * Styles shared by both management panels.
+ * Styles shared by the management panels.
  *
  * Every colour, font and border comes from a VS Code theme variable, so the
  * panels follow the editor's theme (including high-contrast themes) instead of
@@ -7,9 +7,10 @@
  * transparent ones, which is what keeps a panel legible in a light theme, a dark
  * theme and a high-contrast theme without a single conditional.
  *
- * The panel-specific rules live in `providers.css` and `cost.css`. Anything both
- * need belongs here, so the two panels cannot drift into looking like different
- * products.
+ * The panel-specific rules live in `cost.css`. Anything a panel needs that is
+ * not specific to it belongs here, so nothing has to be duplicated — and there
+ * is exactly one panel left to keep in step, the provider manager having moved
+ * to native QuickPick and input-box flows.
  */
 
 .pp-root {

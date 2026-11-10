@@ -22,6 +22,7 @@
 
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
+import { describeError } from '../core/errors';
 import { AIOrchestrator } from '../orchestration/AIOrchestrator';
 import { FetchTransport } from '../providers/HttpTransport';
 import { OPENROUTER_DEFAULT_BASE_URL, OpenRouterClient } from '../providers/OpenRouterClient';
@@ -45,8 +46,15 @@ import {
   type KeySummary,
 } from '../security/SecretManager';
 import type { AIProviderStatus, ProviderId } from '../types/provider';
-import type { AccountInfo, ModelTaskId, SelectionLevel } from '../types/providerConfig';
+import type {
+  AccountInfo,
+  ModelTaskId,
+  ModelSelection,
+  ProviderView,
+  SelectionLevel,
+} from '../types/providerConfig';
 import type { Logger } from '../types';
+import { defaultModelQuery } from '../models/ModelSearch';
 import {
   ProviderViewBuilder,
   type OpenRouterLiveState,
@@ -559,6 +567,96 @@ export class ManagementController {
 
     this.deps.onStateChanged();
     return true;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Native configuration view                                              */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The providers, as the native picker lists them.
+   *
+   * Built by the *same* `ProviderViewBuilder` the sidebar used, from the same
+   * dependencies, so a picker cannot describe a provider differently from the
+   * panel it replaced — no second construction path, and therefore no second
+   * place for a status line to drift.
+   *
+   * The query is the empty default: the builder only needs one to page a model
+   * table, and no model rows are read here.
+   */
+  providersForPicker(): ProviderView[] {
+    const snapshot = this.viewBuilder.build({
+      query: defaultModelQuery(),
+      offset: 0,
+      detailsModelId: null,
+      adviceTaskId: null,
+      notice: null,
+    });
+    return snapshot.providers;
+  }
+
+  /** Which provider is receiving turns right now. */
+  currentProviderId(): ProviderId {
+    return this.activeProviderId();
+  }
+
+  /** The open workspace folder, if there is exactly one to speak of. */
+  workspaceRootPath(): string | null {
+    return this.deps.workspaceRoot();
+  }
+
+  /**
+   * Make a provider the one that receives turns, and remember the choice.
+   *
+   * The setting is written *first*, because it is the durable record: switching
+   * only the live registry would revert on the next reload, and a developer
+   * would reasonably read that as the extension forgetting their choice.
+   *
+   * A provider that is not registered is refused before anything is written,
+   * with the provider's own status line as the reason — switching to a backend
+   * that cannot answer fails on the next turn otherwise, with a message about a
+   * request rather than about the choice that caused it.
+   */
+  async selectProvider(providerId: ProviderId): Promise<boolean> {
+    if (!this.deps.providers.select(providerId)) {
+      const view = this.providersForPicker().find((entry) => entry.id === providerId);
+      const why = view ? view.statusMessage : 'The provider is not registered in this build.';
+      void vscode.window.showWarningMessage(`PairPilot could not switch provider. ${why}`);
+      return false;
+    }
+
+    try {
+      await vscode.workspace
+        .getConfiguration('pairpilot')
+        .update('providers.activeProvider', providerId, vscode.ConfigurationTarget.Global);
+    } catch (error) {
+      this.deps.logger.warn(
+        `The provider switched for this session but the setting could not be saved: ${describeError(error)}`
+      );
+      // The switch did happen, so this is still a success for the caller; the
+      // warning is about persistence, and it is said rather than swallowed.
+      void vscode.window.showWarningMessage(
+        'PairPilot switched provider for this session, but could not save the choice to your settings.'
+      );
+    }
+
+    this.onConfigurationChanged();
+    this.deps.onStateChanged();
+    return true;
+  }
+
+  /** The stored selection at one level, for describing what is already set. */
+  selectionAt(level: SelectionLevel, key: string | null): ModelSelection | null {
+    return this.selection.selectionAt(level, key ?? undefined);
+  }
+
+  /** What a level would resolve to if the level itself were cleared. */
+  resolveFor(target: { roleId?: ModelTaskId; projectPath: string | null }): {
+    modelId: string | null;
+    sourceLabel: string;
+  } {
+    const resolved = this.selection.resolve(target);
+    return { modelId: resolved.modelId, sourceLabel: resolved.sourceLabel };
   }
 
   /* ---------------------------------------------------------------------- */

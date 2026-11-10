@@ -13,7 +13,7 @@
  */
 
 import * as vscode from 'vscode';
-import { parseCostRequest } from './ProviderMessages';
+import { parseCostRequest } from './CostMessages';
 import type { CostView } from './CostViewBuilder';
 import {
   buildMissingAssetsHtml,

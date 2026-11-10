@@ -4,6 +4,105 @@ All notable changes to PairPilot are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+Code review moved into the editor, and the provider/model screens moved out of
+the sidebar. Both come from the same problem: a small Webview was being asked to
+be a review surface and a settings application at once.
+
+### Changed
+
+- **A written file is reviewed on the file itself.** Approve, Request changes and
+  Reject live on a comment thread anchored to the top of the document, with a
+  native modal for the decision. The sidebar's Review tab is now a *status* view:
+  which files are pending, written, under revision or failed, and a button that
+  opens the editor.
+- **The panel has no way to decide.** `WebviewRequest` has no approval or decision
+  variant at all, so a stale, reloaded or compromised panel cannot approve code —
+  the message it would have to send does not exist. The old hash-carrying decision
+  messages were removed with their validator branches.
+- **Provider and model configuration is native UI.** `PairPilot: Select Provider…`
+  and `PairPilot: Select Model…` run QuickPick flows — provider, then the step to
+  configure, then filters, then a searchable list, then confirm — instead of a
+  provider manager panel. A status-bar item shows the active provider and model
+  and opens the same flow. The `pairpilot.providersView` panel and its
+  `Show AI Providers & Models` command are gone.
+- **Roadmap-driven progression.** When the workspace has a `ROADMAP.md`, the
+  coding prompt carries it, and approving a file updates that task's status and
+  offers the next file. A task becomes `done` only when all its files are approved
+  *and* you confirm the work was verified; an approved-but-untested task stays
+  `in_progress`.
+
+### Added
+
+- `src/roadmap/` — a tolerant ROADMAP.md parser with dependency-aware selection, a
+  `WorkspaceEdit`-based status writer, and the continuation that decides what comes
+  next, all testable without an editor.
+- `src/review/` — the in-editor review surface, keyed per document, with a session
+  that refuses a stale decision by content hash and document fingerprint — and
+  `WritePermission`, the native prompt that answers the permission gate before
+  anything is written.
+- `src/config/` — the native selection flow's prompt data, the picker, and the
+  status-bar item.
+- Prompting: generated code now carries Persian explanation comments (what and why,
+  in the target language's comment syntax), and the coding turn is told to write
+  exactly one file from the roadmap at a time.
+
+### Fixed
+
+- **A proposal stopped dead at "waiting for permission to write".** Removing the
+  sidebar's approval buttons left the pre-write gate with no surface at all:
+  `approveFileCreation` and `rejectFileCreation` had no caller, the panel said the
+  prompt was in the editor, and `PairPilot: Review a Waiting File…` answered "no
+  file is waiting" — while the workflow sat at `WAITING_FILE_APPROVAL` with no way
+  to leave it. The gate is now a native prompt (`WritePermission`) raised as soon
+  as the proposal arrives: Write it, Request changes, Reject, plus Write all when a
+  batch is in flight. A dismissed prompt stays pending and can be raised again;
+  a prompt whose proposal changed underneath it applies nothing.
+- **A correction could not be requested before the first write.** Request changes
+  at the permission gate had no path — the only revision route required a written
+  file to roll back. `requestChangesBeforeWrite` shares the revision turn with the
+  written-file path and skips the rollback, because nothing has been written yet.
+- **A settled batch could discard the file the roadmap had just offered.** After
+  the last file of a batch, the advisor turn and the next file's turn ended up
+  ordering nested turns from one counter, so the second was rejected as stale and
+  the offer was lost inside the advisor's error handler. The counter is now
+  advanced before the batch settles, and the approved paths are captured before
+  the change set — and with it the batch and approval history — is discarded.
+- **`roadmap.md` written in place was unreadable as `in_progress`.** The status
+  reader stripped every underscore rather than only wrapping emphasis, turning the
+  canonical `in_progress` into `inprogress` and silently resetting started tasks
+  to `todo`.
+- **"make simple x.html for test agent" died on the `/changes` contract, with the
+  code one level away.** Four separate defects produced the same refusal for
+  replies that *did* carry complete file content:
+  - The adapter's nested-payload lift was gated on the mere presence of a root
+    `changes` key, so a reply pairing an empty root `changes: []` with the real
+    list under `proposal` never had the payload lifted — the model's summary was
+    shown, the complete file beside it was discarded, and the turn failed with
+    `A code_proposal must carry a non-empty "changes" array`.
+  - Parsing stopped at the first JSON object that failed validation, so a reply
+    that narrated a summary-shaped object first and delivered the real proposal a
+    paragraph later never found the proposal. The scan now continues, with a
+    containment gate: nothing inside a rejected whole document may validate on
+    its own, so a proposal refused as a set still cannot have one file salvaged
+    out of it.
+  - A bare change spelling its operation in `type`
+    (`{"file":"x.html","type":"create","content":"…"}`) was misread as an
+    envelope and refused with the backwards complaint that `"create"` is not a
+    message type. A `changes` value sent as a single object is now likewise read
+    as a one-change array.
+  - In Coding mode an unambiguous build instruction offered the model a *menu* of
+    message types. The model choosing "describe the file" is the failure: such a
+    turn now demands a `code_proposal` with complete content outright.
+- **A revision request had no correction loop at all.** `retryWithFeedback` — the
+  path every "request changes" decision takes — made exactly one request with the
+  generic type menu. The first summary-shaped reply ended the revision with the
+  contract error and the developer's feedback was lost with it. The revision turn
+  now demands the proposal outright and runs the same bounded correction loop as
+  the primary turn: up to two corrective retries carrying the validator's own
+  field-level complaint, then a failure that names the real problem.
+
 ## [0.3.1]
 
 A follow-up to the report of:

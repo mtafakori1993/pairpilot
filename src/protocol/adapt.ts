@@ -317,10 +317,24 @@ export function adaptCandidate(value: unknown): AdaptedCandidate {
   // Checked before anything else: when a root object has BOTH a `type` and a
   // nested `proposal` carrying the changes, the nested object is the payload and
   // the root is a thin wrapper.
+  //
+  // The root's own `changes` must be *usable* before it can outrank the nested
+  // payload. A model asked for "a simple x.html" has been observed to answer
+  // with an empty root `changes` array beside the real list under `proposal`:
+  //     { "type": "code_proposal", "message": "Creates a simple x.html page…",
+  //       "changes": [], "proposal": { "changes": [ …complete file… ] } }
+  // Until this gate counted *entries* rather than the mere presence of an array,
+  // the empty array occupied the key, the lift was skipped, and the developer
+  // was told the reply "did not match the PairPilot response contract" while
+  // the entire file content sat one level down. That is the reported bug: the
+  // summary was real, and so was the code.
   const nested = value['proposal'] ?? value['code_proposal'] ?? value['result'] ?? value['data'];
-  if (isRecord(nested) && !Array.isArray(value['changes'])) {
+  const rootChanges = value['changes'];
+  const rootHasUsableChanges = Array.isArray(rootChanges) && rootChanges.length > 0;
+  if (isRecord(nested) && !rootHasUsableChanges) {
     const nestedHasPayload =
       Array.isArray(nested['changes']) ||
+      isRecord(nested['changes']) ||
       Array.isArray(nested['files']) ||
       Array.isArray(nested['blocks']);
     if (nestedHasPayload) {
@@ -364,8 +378,16 @@ export function adaptCandidate(value: unknown): AdaptedCandidate {
   // Checked before the legacy shape, because a bare change also has `file` and
   // `operation` and would otherwise be misread as a 0.1.x envelope — which is
   // how a fragment of a larger reply could be quietly accepted on its own.
+  //
+  // A `type` that names an *operation* — `{"file":"x.html","type":"create",
+  // "content":"…"}` — is still a bare change: models spell the operation key
+  // that way, and reading it as a message type produced the exactly-backwards
+  // complaint `"create" is not a PairPilot message type` against a reply that
+  // was one rename away from correct. Only a *known message type* disqualifies
+  // the bare-change shape, because that means the object is an envelope of
+  // some other kind.
   if (
-    asString(value['type']) === undefined &&
+    !isKnownMessageType(value['type']) &&
     asString(pick(value, FILE_KEYS)) !== undefined &&
     (pick(value, CONTENT_KEYS) !== undefined || Array.isArray(value['blocks']))
   ) {
@@ -430,6 +452,16 @@ function finish(
     out['changes'] = out['files'];
     delete out['files'];
     notes.push('The reply listed its changes under "files"; they were read as "changes".');
+  }
+
+  // A `changes` given as a single object rather than an array is one change,
+  // written the way a model that has only one file to propose naturally would.
+  // Wrapping it is shape rewriting: the object is the model's own, unchanged.
+  // Without this, the lift above recognised the shape and validation then
+  // refused it for not being an array.
+  if (!Array.isArray(out['changes']) && isRecord(out['changes'])) {
+    out['changes'] = [out['changes']];
+    notes.push('The reply carried "changes" as a single object; it was read as a one-change array.');
   }
 
   if (!asString(out['type'])) {

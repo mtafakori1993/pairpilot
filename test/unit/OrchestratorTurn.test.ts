@@ -41,7 +41,7 @@ vi.mock('vscode', () => ({
   Uri: { file: (fsPath: string) => ({ scheme: 'file', fsPath }) },
 }));
 
-import { Orchestrator, type OrchestratorConfig, type OrchestratorDeps } from '../../src/core/Orchestrator';
+import { Orchestrator, type OrchestratorConfig, type OrchestratorDeps, type OrchestratorWritePermissionRequest } from '../../src/core/Orchestrator';
 import { SessionStore } from '../../src/storage/SessionStore';
 import { WorkspaceContext } from '../../src/context/WorkspaceContext';
 import { PAIRPILOT_PROTOCOL_VERSION } from '../../src/protocol/types';
@@ -171,7 +171,11 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function makeOrchestrator(ai: ScriptedAI): Orchestrator {
+function makeOrchestrator(
+  ai: ScriptedAI,
+  roadmap?: OrchestratorDeps['roadmap'],
+  askWritePermission?: OrchestratorDeps['askWritePermission']
+): Orchestrator {
   const deps: OrchestratorDeps = {
     context: {} as never,
     logger,
@@ -180,9 +184,10 @@ function makeOrchestrator(ai: ScriptedAI): Orchestrator {
     store,
     diff: {} as never,
     notify: () => {},
-    notifyCodeDelta: () => {},
     notifyTextDelta: () => {},
     notifyWritingProgress: () => {},
+    ...(roadmap ? { roadmap } : {}),
+    ...(askWritePermission ? { askWritePermission } : {}),
     readConfig: () => CONFIG,
   };
   return new Orchestrator(deps);
@@ -1020,3 +1025,401 @@ describe('holding a write', () => {
   });
 });
 
+
+/* -------------------------------------------------------------------------- */
+/* Scenario: the roadmap in the prompt                                        */
+/* -------------------------------------------------------------------------- */
+
+describe('the roadmap in a coding turn', () => {
+  it('carries the roadmap into the prompt', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const roadmap: OrchestratorDeps['roadmap'] = {
+      describeForPrompt: async () => 'Roadmap (ROADMAP.md):\n- models [todo] Domain models',
+      advance: async () => ({ kind: 'no_roadmap' }),
+    };
+    const orchestrator = makeOrchestrator(ai, roadmap);
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(ai.prompts[0]).toContain('Roadmap (ROADMAP.md):');
+    expect(ai.prompts[0]).toContain('Follow this roadmap.');
+  });
+
+  it('runs the turn without one when there is no roadmap', async () => {
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const roadmap: OrchestratorDeps['roadmap'] = {
+      describeForPrompt: async () => null,
+      advance: async () => ({ kind: 'no_roadmap' }),
+    };
+    const orchestrator = makeOrchestrator(ai, roadmap);
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(ai.prompts[0]).not.toContain('Follow this roadmap.');
+    expect(orchestrator.errorValue).toBeNull();
+  });
+
+  it('does not fail the turn when the roadmap cannot be read', async () => {
+    // The developer asked for a file, not for a report on their markdown. A
+    // broken roadmap must not become a broken workflow.
+    const ai = new ScriptedAI(REPORTED_REPLY);
+    const roadmap: OrchestratorDeps['roadmap'] = {
+      describeForPrompt: async () => {
+        throw new Error('permission denied');
+      },
+      advance: async () => ({ kind: 'no_roadmap' }),
+    };
+    const orchestrator = makeOrchestrator(ai, roadmap);
+
+    await orchestrator.submitTask('Create a PHP User class');
+
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    expect(logger.warns.some((line) => line.includes('roadmap could not be read'))).toBe(true);
+  });
+
+  it('does not touch the roadmap while the provenance of the turn is unsettled', async () => {
+    // A proposed-but-unwritten file advances nothing: the roadmap records what
+    // was kept, so an offer made before a decision would be a lie.
+    let advances = 0;
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const roadmap: OrchestratorDeps['roadmap'] = {
+      describeForPrompt: async () => null,
+      advance: async () => {
+        advances += 1;
+        return { kind: 'no_roadmap' };
+      },
+    };
+    const orchestrator = makeOrchestrator(ai, roadmap);
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(advances).toBe(0);
+    expect(orchestrator.offeredRoadmapFile).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Scenario I: the gate is answerable                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The 0.4.0 dead end, replayed.
+ *
+ * The sidebar's permission buttons were removed with the rest of the panel's
+ * authority, and nothing took their place — so a proposal reached
+ * `WAITING_FILE_APPROVAL` and stayed there. The panel said "the prompt is in the
+ * editor", the palette answered "no file is waiting", and the turn could not be
+ * completed at all.
+ *
+ * What is pinned here is that the workflow *asks*, with everything an answer
+ * needs: the path, the operation, the content hash the answer must echo, the set
+ * hash when a batch is in flight — and that answering "changes" revises the
+ * proposal without ever touching the disk.
+ */
+describe('the pre-write permission gate', () => {
+  /** A revision of the reported proposal, for the "request changes" path. */
+  const REVISED_REPLY = JSON.stringify({
+    protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+    type: 'code_proposal',
+    message: 'Tightened the class.',
+    changes: [
+      {
+        id: 'change_001',
+        file: 'src/User.php',
+        operation: 'create',
+        description: 'A final PHP user entity',
+        content: '<?php\n\nfinal class User\n{\n    public function __construct(public readonly string $name) {}\n}\n',
+        dependencies: [],
+        risk: 'low',
+      },
+    ],
+  });
+
+  it('asks before writing, and nothing is on disk while it asks', async () => {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const ai = new ScriptedAI(REPORTED_REPLY);
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+
+    await orchestrator.submitTask('Create a PHP User class');
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.relativePath).toBe('src/User.php');
+    expect(requests[0]!.operation).toBe('create');
+    // The binding a decision must echo back, so a prompt left open across a
+    // revision cannot authorise the earlier content.
+    expect(requests[0]!.contentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(requests[0]!.setHash).toBeNull();
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+  });
+
+  it('offers the set hash and position when more than one file is waiting', async () => {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const ai = new ScriptedAI(MULTI_FILE_REPLY);
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+
+    await orchestrator.submitTask('Create a user module');
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.position).toEqual({ index: 1, total: 2 });
+    expect(requests[0]!.setHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(requests[0]!.setHash).not.toBe(requests[0]!.contentHash);
+  });
+
+  it('revises without writing when changes are requested at the gate', async () => {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const ai = new ScriptedAI(REPORTED_REPLY, REVISED_REPLY);
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+
+    await orchestrator.submitTask('Create a PHP User class');
+    const first = requests[0]!;
+
+    await orchestrator.requestChangesBeforeWrite(first.contentHash, 'make the class final');
+
+    // The revision was requested from the model and staged back at the gate.
+    expect(ai.turnCount).toBe(2);
+    expect(ai.prompts[1]).toContain('make the class final');
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.relativePath).toBe('src/User.php');
+    expect(requests[1]!.contentHash).not.toBe(first.contentHash);
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    // Nothing was written on the way through: the gate is before the writer.
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('refuses a revision request made against an earlier version', async () => {
+    // A prompt left open across a revision could still name the old hash. It
+    // must be refused rather than revising bytes the developer no longer sees.
+    const ai = new ScriptedAI(REPORTED_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('Create a PHP User class');
+    const turnsBefore = ai.turnCount;
+
+    await orchestrator.requestChangesBeforeWrite('0'.repeat(64), 'try again');
+
+    expect(ai.turnCount).toBe(turnsBefore);
+    expect(orchestrator.errorValue).toMatch(/changed|version|approval/i);
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+  });
+
+  it('writes nothing when the developer declines at the gate', async () => {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const ai = new ScriptedAI(REPORTED_REPLY);
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+
+    await orchestrator.submitTask('Create a PHP User class');
+    orchestrator.rejectFileCreation(requests[0]!.contentHash);
+
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    expect(orchestrator.pendingFilePathValue).toBeNull();
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+    expect(orchestrator.noticeValue).toMatch(/declined/i);
+  });
+
+  it('does not ask at all when there is no UI to ask with', async () => {
+    // The hook is optional so the workflow stays constructible in a host with no
+    // prompts. It must not crash, and the gate must still hold.
+    const ai = new ScriptedAI(REPORTED_REPLY);
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('Create a PHP User class');
+
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The reported interaction, replayed turn by turn                           */
+/*                                                                            */
+/* "make simple x.html for test agent" produced the summary line and then the */
+/* contract error. Three of the four reply shapes a model plausibly answers   */
+/* with — nested payload beside an empty root array, a single-object changes  */
+/* value, a bare change spelling its operation in "type" — were refused as    */
+/* though the code were absent, and the prompt offered a type menu where the  */
+/* instruction needed a demand. These tests run the whole turn: classification, */
+/* prompt, parse, adaptation, validation and staging, and stop where the      */
+/* existing suite stops — at the permission gate, with the file verified NOT   */
+/* written and the queue holding the real content.                            */
+/* -------------------------------------------------------------------------- */
+
+describe('make simple x.html for test agent', () => {
+  const FULL_HTML =
+    '<!DOCTYPE html>\n<html>\n<head><meta charset="utf-8"><title>Agent test</title></head>\n<body><h1>Test agent page</h1></body>\n</html>\n';
+  const change = {
+    file: 'x.html',
+    operation: 'create',
+    description: 'A simple page the test agent loads.',
+    content: FULL_HTML,
+  };
+
+  it('stages the real content when the model nests it beside an empty root changes array', async () => {
+    // The exact shape of the reported failure: the model echoed its summary at
+    // the root with `changes: []`, then delivered the actual file under
+    // `proposal`. The old lift gate saw the root array — empty — and refused,
+    // with the file content one key away.
+    const reply = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Creates a simple x.html page for the test agent to load and verify.',
+      changes: [],
+      proposal: { changes: [change] },
+    });
+    const ai = new ScriptedAI(reply);
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('make simple x.html for test agent');
+
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    expect(orchestrator.changeSetPlanValue.map((entry) => entry.file)).toEqual(['x.html']);
+    // The queue holds the reviewed bytes, not the summary.
+    expect(orchestrator.pendingFilePathValue).toBe('x.html');
+    expect(fs.existsSync(path.join(root, 'x.html'))).toBe(false);
+  });
+
+  it('recovers the real proposal after a summary-shaped reply, within the retry budget', async () => {
+    // The model's first answer narrates instead of proposing. The turn retries
+    // with the validator's own complaint, and the second answer carries the
+    // file. The correction prompt must have asked for exactly that.
+    const summary = JSON.stringify({
+      type: 'code_proposal',
+      message: 'Creates a simple x.html page for the test agent to load and verify.',
+    });
+    const proposal = JSON.stringify({
+      type: 'code_proposal',
+      message: 'Creating the page.',
+      changes: [change],
+    });
+    const ai = new ScriptedAI(summary, proposal);
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('make simple x.html for test agent');
+
+    expect(ai.turnCount).toBe(2);
+    expect(ai.prompts[1]).toContain('"changes"');
+    expect(ai.prompts[1]).toContain('"content"');
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.changeSetPlanValue.map((entry) => entry.file)).toEqual(['x.html']);
+    expect(fs.existsSync(path.join(root, 'x.html'))).toBe(false);
+  });
+
+  it('asks for the proposal outright rather than offering a type menu', async () => {
+    // In Coding mode an unambiguous build instruction must tell the model to
+    // answer with a code_proposal carrying complete content. The generic list
+    // invites "here is a description" as an answer, which is the reported bug.
+    const ai = new ScriptedAI(
+      JSON.stringify({ type: 'chat_response', message: 'Sure, I can make that.' })
+    );
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('make simple x.html for test agent');
+
+    expect(ai.prompts[0]).toContain('Answer with a "code_proposal"');
+    expect(ai.prompts[0]).toContain('complete final file');
+  });
+
+  it('demands a proposal only where the mode allows one', async () => {
+    // A planning request must not carry the demand: the mode gate would refuse
+    // the proposal anyway, and a prompt that demands one thing and forbids
+    // another is two rules and no way to choose.
+    const ai = new ScriptedAI(
+      JSON.stringify({ type: 'chat_response', message: 'We are still designing.' })
+    );
+    const orchestrator = makeOrchestrator(ai);
+
+    await orchestrator.submitTask('Discuss the design for a test page first. Do not write code yet.');
+
+    expect(ai.prompts[0]).not.toContain('Answer with a "code_proposal"');
+    expect(ai.prompts[0]).toContain('Do not produce a "code_proposal"');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The revision turn that failed the contract                                */
+/*                                                                            */
+/* The reported failure came back after the first fix: a "request changes"   */
+/* decision routes through `retryWithFeedback`, which made exactly one request */
+/* with the generic type menu and had no correction loop. The first           */
+/* summary-shaped reply ended the revision with the contract error. These      */
+/* tests pin the whole revision path: the demand hint, the bounded retry, and */
+/* that the developer's feedback survives into the corrected proposal.        */
+/* -------------------------------------------------------------------------- */
+
+describe('a revision whose reply misses the contract', () => {
+  /** The summary-shaped reply that broke the revision. */
+  const SUMMARY_ONLY = JSON.stringify({
+    protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+    type: 'code_proposal',
+    message: 'Tightened the User class as requested.',
+  });
+
+  it('corrects a summary-shaped revision and stages the real content', async () => {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const revised = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Tightened the class.',
+      changes: [
+        {
+          file: 'src/User.php',
+          operation: 'create',
+          description: 'A final PHP user entity',
+          content: '<?php\n\nfinal class User {}\n',
+        },
+      ],
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, SUMMARY_ONLY, revised);
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+
+    await orchestrator.submitTask('Create a PHP User class');
+    const first = requests[0]!;
+    await orchestrator.requestChangesBeforeWrite(first.contentHash, 'make the class final');
+
+    // One revision request plus one corrective retry: bounded, not looping.
+    expect(ai.turnCount).toBe(3);
+    // The revision prompt demands the proposal outright rather than offering
+    // the type menu, and the correction names the missing field.
+    expect(ai.prompts[1]).toContain('Answer with a "code_proposal"');
+    expect(ai.prompts[2]).toContain('"changes"');
+    expect(ai.prompts[2]).toContain('"content"');
+    // The feedback survived into the corrected proposal.
+    expect(ai.prompts[1]).toContain('make the class final');
+    // The corrected proposal is staged at the gate, not written.
+    expect(requests[1]!.relativePath).toBe('src/User.php');
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('fails the revision after the retry budget, writing nothing', async () => {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const ai = new ScriptedAI(REPORTED_REPLY, SUMMARY_ONLY, SUMMARY_ONLY, SUMMARY_ONLY);
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+
+    await orchestrator.submitTask('Create a PHP User class');
+    const first = requests[0]!;
+    await orchestrator.requestChangesBeforeWrite(first.contentHash, 'make the class final');
+
+    // The revision attempt plus two corrective retries, then a stop: the same
+    // bound the primary turn honours.
+    expect(ai.turnCount).toBe(4);
+    expect(orchestrator.errorValue).toMatch(/changes/i);
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+});

@@ -138,3 +138,25 @@ export function expectedTypeHint(intent: TurnIntent, allowProposals = true): str
     'A request to think about the design is not a request to build it.',
   ].join('\n');
 }
+
+/**
+ * The instruction for a turn that *is* a code change, in a mode that allows one.
+ *
+ * The generic list above invites the model to weigh types; for an unambiguous
+ * build instruction in Coding, weighing is the failure mode. This variant
+ * names the answer outright and restates the two rules a summary-shaped reply
+ * breaks: the `changes` array must exist, and each change's `content` must be
+ * the complete file. A reply that describes the file instead of containing it
+ * is precisely the "did not match the response contract" failure the developer
+ * reported, and this is the one place it can be prevented rather than
+ * corrected.
+ */
+export function codeProposalDemandHint(): string {
+  return [
+    'This turn asks for a code change, and the session is authorised to write code.',
+    'Answer with a "code_proposal". This is not a choice: do not answer with "chat_response", "project_plan" or "architecture_discussion", however natural a summary feels.',
+    'The "changes" array MUST be present and non-empty, and every change MUST carry "file", "operation", "description" and "content".',
+    '"content" is the complete final file — every line, exactly as it should appear on disk. Never a description of the file, never a summary, never a placeholder such as "// rest of the code here".',
+    'If you genuinely cannot produce the code, answer with "clarification_request" and ask the one question that blocks you — but do not answer a build instruction with a description.',
+  ].join('\n');
+}

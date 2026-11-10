@@ -206,6 +206,30 @@ pre,
   white-space: nowrap;
 }
 
+.model-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  font-size: 0.85em;
+}
+
+/* The catalogue's names can be long, and a name that pushes the Change button
+   off the row would hide the only action this line has. */
+.model-bar-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+}
+
+.model-bar .link {
+  flex: 0 0 auto;
+}
+
 /* ------------------------------------------------------------------ tabs -- */
 
 .tabs {

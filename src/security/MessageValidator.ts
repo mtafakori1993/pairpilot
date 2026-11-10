@@ -19,13 +19,12 @@ import { MessageRejectedError } from '../core/errors';
 import type { WebviewRequest } from '../types';
 
 /** Upper bounds, to keep a hostile Webview from allocating without limit. */
+const MAX_FEEDBACK_LENGTH = 8000;
 const MAX_TEXT_LENGTH = 32_000;
-const MAX_FEEDBACK_LENGTH = 8_000;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_ID_LENGTH = 128;
 
 /** SHA-256 hex digest, which is the only accepted hash format. */
-const SHA256_HEX = /^[a-f0-9]{64}$/;
 
 /** Keys that must never appear in an inbound payload (prototype pollution). */
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -62,6 +61,9 @@ export class MessageValidator {
       case 'cancel':
       case 'pauseWrite':
       case 'resumeWrite':
+      case 'openReviewInEditor':
+      case 'continueRoadmap':
+      case 'chooseModel':
       case 'acceptRecommendation':
       case 'dismissRecommendation':
       case 'newSession':
@@ -77,20 +79,6 @@ export class MessageValidator {
 
       case 'submitTask':
         return { type, text: this.requireText(message, 'text', MAX_TEXT_LENGTH, 'task') };
-
-      case 'requestChanges':
-        return {
-          type,
-          contentHash: this.requireHash(message, 'contentHash'),
-          feedback: this.requireText(message, 'feedback', MAX_FEEDBACK_LENGTH, 'feedback'),
-          ...this.readBinding(message),
-        };
-
-      case 'approveFileCreation':
-      case 'rejectFileCreation':
-      case 'approveCode':
-      case 'rejectCode':
-        return { type, contentHash: this.requireHash(message, 'contentHash'), ...this.readBinding(message) };
 
       case 'loadSession':
       case 'deleteSession': {
@@ -150,65 +138,23 @@ export class MessageValidator {
     return value;
   }
 
-  /** Text fields allow whitespace but must carry non-whitespace content. */
+  /**
+   * A required free-text field: present, a string, non-empty and bounded.
+   *
+   * The trim-then-length check is deliberate — a message of nothing but spaces
+   * is empty as far as a model is concerned, and letting it through would send a
+   * turn that asks for nothing.
+   */
   private requireText(
     message: Record<string, unknown>,
     key: string,
     maxLength: number,
-    label: string
+    what: string
   ): string {
     const value = this.requireString(message, key, maxLength);
     if (value.trim().length === 0) {
-      throw new MessageRejectedError(`The ${label} must not be blank.`);
+      throw new MessageRejectedError(`Field "${what}" must not be blank.`);
     }
     return value;
-  }
-
-  private requireHash(message: Record<string, unknown>, key: string): string {
-    const value = this.requireString(message, key, 64);
-    if (!SHA256_HEX.test(value)) {
-      throw new MessageRejectedError(
-        `Field "${key}" must be a lowercase SHA-256 hex digest.`
-      );
-    }
-    return value;
-  }
-
-  /**
-   * Read the optional identity claims a decision may carry.
-   *
-   * These are not trusted — the host checks them against its own record — but
-   * they are still *validated*, because an unvalidated field is a place for a
-   * hostile panel to send something enormous or oddly typed. Anything present
-   * must be exactly the right shape; anything absent is simply not claimed.
-   *
-   * A `proposalVersion` of 0 or a negative number is rejected rather than
-   * ignored: it can only come from a panel that is confused or hostile, and
-   * silently treating it as "no claim" would let such a panel skip the check.
-   */
-  private readBinding(message: Record<string, unknown>): {
-    proposalId?: string;
-    proposalVersion?: number;
-    fileId?: string;
-  } {
-    const binding: { proposalId?: string; proposalVersion?: number; fileId?: string } = {};
-
-    if (message['proposalId'] !== undefined) {
-      binding.proposalId = this.requireString(message, 'proposalId', MAX_ID_LENGTH);
-    }
-    if (message['fileId'] !== undefined) {
-      binding.fileId = this.requireString(message, 'fileId', MAX_ID_LENGTH);
-    }
-    if (message['proposalVersion'] !== undefined) {
-      const version = message['proposalVersion'];
-      if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
-        throw new MessageRejectedError(
-          'Field "proposalVersion" must be a positive integer when present.'
-        );
-      }
-      binding.proposalVersion = version;
-    }
-
-    return binding;
   }
 }

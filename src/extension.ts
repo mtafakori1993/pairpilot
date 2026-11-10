@@ -26,16 +26,18 @@ import { MessageValidator } from './security/MessageValidator';
 import { PairPilotProvider } from './ui/PairPilotProvider';
 import { WebviewMessageRouter } from './ui/WebviewMessageRouter';
 import { ManagementController } from './ui/ManagementController';
-import {
-  catalogNotice,
-  selectionClearedNotice,
-  selectionSetNotice,
-} from './ui/PanelNotices';
-import { ProviderManagementProvider } from './ui/ProviderManagementProvider';
 import { CostDashboardProvider } from './ui/CostDashboardProvider';
+import { ConfigStatusBar } from './config/ConfigStatusBar';
+import { EditorReview } from './review/EditorReview';
+import { ReviewBridge } from './review/ReviewBridge';
+import { WritePermission, type PermissionChoice } from './review/WritePermission';
+import { PairPilotState } from './types';
+import { RoadmapContinuation } from './roadmap/RoadmapContinuation';
+import { RoadmapStore } from './roadmap/RoadmapStore';
+import { ApprovedLedger, RoadmapWorkflow } from './roadmap/RoadmapWorkflow';
 import { registerCommands } from './commands';
 import { registerManagementCommands } from './commands/management';
-import type { ProviderRequest } from './ui/ProviderMessages';
+import { registerReviewCommands } from './commands/review';
 
 /** Mutable holder so a folder change is picked up without re-activating. */
 class WorkspaceHolder {
@@ -160,6 +162,42 @@ async function requestSensitiveFileApproval(
   return choice === ALLOW;
 }
 
+/**
+ * Whether a review request carried any proposal identity.
+ *
+ * The Orchestrator's freshness check treats "no binding at all" and "a binding"
+ * differently, so an empty object must be sent as `undefined` rather than as a
+ * binding that matches nothing.
+ */
+function hasDecisionBinding(
+  binding: { proposalId?: string; proposalVersion?: number; fileId?: string }
+): boolean {
+  return (
+    binding.proposalId !== undefined ||
+    binding.proposalVersion !== undefined ||
+    binding.fileId !== undefined
+  );
+}
+
+/**
+ * Report a permission answer the workflow refused.
+ *
+ * Refusals are recorded on `error` rather than thrown, because every decision
+ * path returns normally. Reading it here is what turns "the modal went away and
+ * nothing happened" into a sentence naming the reason — usually that the
+ * proposal changed while the prompt was open.
+ */
+function reportPermissionRefusal(orchestrator: Orchestrator): void {
+  const reason = orchestrator.errorValue;
+  if (reason === null) {
+    return;
+  }
+  orchestrator.clearError();
+  void vscode.window.showWarningMessage(
+    `PairPilot: that answer was not applied. ${reason}`
+  );
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('PairPilot');
   context.subscriptions.push(output);
@@ -222,6 +260,162 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let provider: PairPilotProvider;
   let management: ManagementController;
 
+  // The bridge holds the review surface's link back into the workflow. It is
+  // declared before both so the hook can close over them; neither exists yet at
+  // construction time, which is why the accessors are functions. A holder object
+  // rather than a `let`, because TypeScript narrows a captured `let` that is
+  // still `null` to `never` inside the closure.
+  const reviewHolder: { current: EditorReview | null } = { current: null };
+
+  const reviewBridge = new ReviewBridge({
+    orchestrator: () => orchestrator,
+    logger,
+  });
+
+  /**
+   * The pre-write permission prompt.
+   *
+   * The decision that was lost when the sidebar's buttons were removed with the
+   * rest of the panel's authority: a proposal reaches `WAITING_FILE_APPROVAL`
+   * before anything is written, and this is what answers it. It is a native
+   * modal rather than an editor thread because at this point there is no code in
+   * the editor to review — the question is whether the workspace may be touched
+   * at all, and the file may not exist yet.
+   *
+   * Every answer goes back through the Orchestrator, which re-verifies it
+   * against the live proposal. A stale or forged answer is refused there, so
+   * nothing below decides whether a write is allowed.
+   */
+  const writePermission = new WritePermission({
+    prompt: async (request): Promise<PermissionChoice> => {
+      const WRITE = 'Write it';
+      const REJECT = 'Reject';
+      const CHANGES = 'Request changes…';
+      const total = request.position?.total ?? 1;
+      const WRITE_ALL = `Write all ${total} files…`;
+
+      const verb = request.operation === 'create' ? 'create' : 'rewrite';
+      const position =
+        request.position && total > 1
+          ? ` (file ${request.position.index} of ${total})`
+          : '';
+      const detail = [request.description, request.rationale ?? '']
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+        .join('\n\n');
+
+      // Only a set of several files offers the batch answer, and it is a
+      // separate press rather than a default: authorising five writes at once
+      // should never be what Return does by accident.
+      const buttons = request.setHash !== null ? [WRITE, WRITE_ALL, CHANGES, REJECT] : [WRITE, CHANGES, REJECT];
+
+      const answer = await vscode.window.showInformationMessage(
+        `PairPilot wants to ${verb} \`${request.relativePath}\`${position}. Nothing has been written yet.`,
+        { modal: true, ...(detail.length > 0 ? { detail } : {}) },
+        ...buttons
+      );
+
+      if (answer === WRITE) {
+        return { kind: 'write' };
+      }
+      if (answer === WRITE_ALL) {
+        return { kind: 'write_all' };
+      }
+      if (answer === REJECT) {
+        return { kind: 'reject' };
+      }
+      if (answer !== CHANGES) {
+        return { kind: 'dismissed' };
+      }
+
+      const feedback = await vscode.window.showInputBox({
+        title: `PairPilot: Changes for ${request.relativePath}`,
+        prompt: 'What should the code do instead?',
+        placeHolder: 'e.g. use a prepared statement instead of string concatenation',
+        ignoreFocusOut: true,
+        validateInput: (value) =>
+          value.trim().length === 0 ? 'Describe the change you want before requesting it.' : undefined,
+      });
+      if (feedback === undefined) {
+        return { kind: 'dismissed' };
+      }
+      return { kind: 'revise', feedback };
+    },
+    apply: async (request, choice) => {
+      const binding = hasDecisionBinding(request.binding) ? { ...request.binding } : undefined;
+      // A refusal is recorded on `error`, and an earlier one must not be
+      // attributed to this answer — so the slate is cleared first, not after.
+      orchestrator.clearError();
+      switch (choice.kind) {
+        case 'write':
+          await orchestrator.approveFileCreation(request.contentHash, binding);
+          reportPermissionRefusal(orchestrator);
+          return;
+        case 'write_all':
+          // The set hash authorises every remaining file. The workflow records
+          // that on the batch as permission to write — each file is still shown
+          // for review as it is written.
+          await orchestrator.approveFileCreation(request.setHash ?? request.contentHash, binding);
+          reportPermissionRefusal(orchestrator);
+          return;
+        case 'reject':
+          orchestrator.rejectFileCreation(request.contentHash, binding);
+          reportPermissionRefusal(orchestrator);
+          return;
+        case 'revise':
+          await orchestrator.requestChangesBeforeWrite(request.contentHash, choice.feedback, binding);
+          // A revision turn reports its own failure. The gate only reports when
+          // it never moved — which is the one case that means "not applied".
+          if (orchestrator.machine.is(PairPilotState.WAITING_FILE_APPROVAL)) {
+            reportPermissionRefusal(orchestrator);
+          }
+          return;
+      }
+    },
+    // Asked of the workflow, not remembered here: a cancelled turn or another
+    // file's gate makes an old prompt stale, and a prompt that can only be
+    // refused should not be shown at all.
+    isLive: () => orchestrator.machine.is(PairPilotState.WAITING_FILE_APPROVAL),
+    logger,
+  });
+
+  // The roadmap is read from the workspace on each turn rather than captured
+  // once, so a file the developer edits while PairPilot runs takes effect on the
+  // next file instead of after a window reload.
+  const roadmapStore = new RoadmapStore({
+    guard: () => workspaceHolder.get()?.pathGuard ?? null,
+    workspaceRoot: () => workspaceHolder.get()?.workspaceRoot ?? null,
+    logger,
+  });
+  const roadmapWorkflow = new RoadmapWorkflow({
+    store: roadmapStore,
+    continuation: new RoadmapContinuation({ store: roadmapStore, logger }),
+    ledger: new ApprovedLedger(),
+    logger,
+    /**
+     * Ask whether the work passed its checks, in a modal.
+     *
+     * A modal rather than a toast: this writes `done` into the project's plan,
+     * and a notification that disappears is not consent. Escape and dismissal
+     * both return false, so an unanswered question never completes a task.
+     */
+    confirmVerified: async (taskId) => {
+      const CONFIRMED = 'Yes, it passed';
+      const answer = await vscode.window.showInformationMessage(
+        `PairPilot: has the work for "${taskId}" been verified?`,
+        {
+          modal: true,
+          detail:
+            'Its roadmap task is marked done only when its checks have passed. Otherwise it stays in progress, and no next task is started.',
+        },
+        CONFIRMED,
+        'Not yet'
+      );
+      return answer === CONFIRMED;
+    },
+    onChanged: () => provider?.refresh(),
+  });
+
   const orchestrator = new Orchestrator({
     context,
     logger,
@@ -238,17 +432,71 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     store,
     diff,
     notify: () => provider.refresh(),
-    notifyCodeDelta: (blockIndex, text) => provider.postCodeDelta(blockIndex, text),
     notifyTextDelta: (text) => provider.postTextDelta(text),
     notifyWritingProgress: (written, total, relativePath) =>
       provider.postWritingProgress(written, total, relativePath),
+    openReview: async (request) => {
+      const surface = reviewHolder.current;
+      if (!surface) {
+        return;
+      }
+      // Recorded before the thread opens, so a decision can never arrive for a
+      // review the bridge has not heard of.
+      reviewBridge.remember(request);
+      await surface.openReview(request);
+    },
+    // Asked before anything is written. The answer comes back through the same
+    // decision methods a thread button uses, so the prompt has no authority of
+    // its own.
+    askWritePermission: async (request) => {
+      await writePermission.ask(request);
+    },
+    roadmap: roadmapWorkflow,
     readConfig: toOrchestratorConfig,
+  });
+
+  // The in-editor review surface. Its `decide` is the only path from a thread
+  // button or the native prompt into the workflow.
+  reviewHolder.current = new EditorReview({
+    decide: async (_session, result) => {
+      await reviewBridge.apply(result.outcome);
+      if (orchestrator.errorValue !== null) {
+        reviewBridge.reportRefusal(orchestrator, result.outcome.decision);
+      }
+    },
+    logger,
+  });
+  context.subscriptions.push(reviewHolder.current);
+
+  registerReviewCommands(context, {
+    review: reviewHolder.current,
+    permission: writePermission,
+    logger,
   });
 
   provider = new PairPilotProvider(context.extensionUri, {
     orchestrator,
     store,
     runtimeStatus: () => providers.activeRuntimeStatus(),
+    /**
+     * The provider and model a coding turn would use right now.
+     *
+     * Resolved through the same selection service the workflow uses, so the
+     * panel cannot say "automatic" while a stored role selection is in force.
+     */
+    modelConfig: () => {
+      const providerId = management.currentProviderId();
+      const provider = management.providersForPicker().find((entry) => entry.id === providerId);
+      const resolved = management.resolveFor({
+        roleId: 'coding',
+        projectPath: management.workspaceRootPath(),
+      });
+      const modelLabel =
+        resolved.modelId === null
+          ? 'automatic'
+          : (management.catalog.get(resolved.modelId)?.name ?? resolved.modelId);
+      return { providerLabel: provider?.label ?? providerId, modelLabel };
+    },
     workspace: () => workspaceHolder.get(),
     logger,
     onMessage: (raw) => router.handle(raw),
@@ -258,16 +506,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   /* AI providers, models and cost                                          */
   /* ---------------------------------------------------------------------- */
 
-  // Held in `let` bindings because the two panels and the controller refer to
-  // each other: the controller tells the panels to re-render, and a panel's
-  // message is handled by the controller.
-  let providersView: ProviderManagementProvider | null = null;
+  // Held in a `let` binding because the cost panel and the controller refer to
+  // each other: the controller tells the panel to re-render, and the panel's
+  // actions are handled by the controller.
   let costView: CostDashboardProvider | null = null;
 
+  // Created before the controller so the very first state change can repaint
+  // it; it reads only through the controller, never the other way round.
+  let statusBar: ConfigStatusBar | null = null;
+
   const refreshPanels = (): void => {
-    providersView?.refresh();
     costView?.refresh();
     provider.refresh();
+    statusBar?.refresh();
   };
 
   management = new ManagementController({
@@ -283,11 +534,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // selections. Makes no network call of its own.
   await management.init();
 
-  providersView = new ProviderManagementProvider(context.extensionUri, {
-    builder: management.viewBuilder,
-    logger,
-    handle: (request) => handleProviderRequest(request),
-  });
+  // The status bar is the sidebar's replacement for "which provider, which
+  // model": always visible, one click from the native selection flow.
+  statusBar = new ConfigStatusBar(management);
+  context.subscriptions.push(statusBar);
 
   costView = new CostDashboardProvider(context.extensionUri, {
     buildView: (rangeDays) => management.buildCostView(rangeDays),
@@ -295,149 +545,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     logger,
   });
 
-  /**
-   * Act on a validated request from the management panel.
-   *
-   * The panel has already checked the shape of everything here and handled the
-   * messages that concern only its own presentation; what arrives is a request
-   * to change state, and each branch either performs it or explains why not.
-   */
-  async function handleProviderRequest(request: ProviderRequest): Promise<void> {
-    // Cleared first, so a sentence can never outlive the action it described.
-    // A branch that has something true to report sets one below; the rest leave
-    // the panel silent rather than repeating what its own state already shows.
-    providersView?.setNotice(null);
-
-    switch (request.type) {
-      case 'ready': {
-        // The first thing that touches the network, and only because the
-        // developer opened this screen. Both calls are no-ops when the catalogue
-        // is fresh and the connection was confirmed moments ago.
-        const refreshed = await management.refreshCatalogIfDue();
-        await management.ensureConnectionChecked();
-        // Only a failure is worth reporting here. An automatic refresh that
-        // worked changes nothing the developer was looking at, but one that
-        // failed explains why the prices on screen are from a previous session.
-        if (refreshed !== null && refreshed.status === 'failed') {
-          providersView?.setNotice(catalogNotice(refreshed));
-        }
-        refreshPanels();
-        return;
-      }
-
-      case 'setApiKey':
-        // The prompt, the toast and the card's own auth state all report this;
-        // a fourth telling in the panel would be noise.
-        await management.promptForApiKey();
-        refreshPanels();
-        return;
-
-      case 'clearApiKey':
-        // The panel asks for confirmation before sending this.
-        await management.disconnect({ confirm: false });
-        refreshPanels();
-        return;
-
-      case 'testConnection':
-        await management.testConnection({ announce: true });
-        refreshPanels();
-        return;
-
-      case 'refreshCatalog': {
-        // Announced in the panel rather than in a toast: this request came from
-        // the panel, which can take thirty seconds to answer and says nothing at
-        // all on screen when it fails.
-        const outcome = await management.refreshCatalog({ announce: false });
-        providersView?.setNotice(catalogNotice(outcome));
-        refreshPanels();
-        return;
-      }
-
-      case 'selectProvider': {
-        await vscode.workspace
-          .getConfiguration('pairpilot')
-          .update('providers.activeProvider', request.providerId, vscode.ConfigurationTarget.Global);
-        management.onConfigurationChanged();
-        refreshPanels();
-        return;
-      }
-
-      case 'setProviderEnabled': {
-        if (request.providerId !== 'openrouter') {
-          return;
-        }
-        await vscode.workspace
-          .getConfiguration('pairpilot')
-          .update('providers.openrouter.enabled', request.enabled, vscode.ConfigurationTarget.Global);
-        management.onConfigurationChanged();
-        refreshPanels();
-        return;
-      }
-
-      case 'toggleFavorite':
-        await management.catalog.toggleFavorite(request.modelId);
-        refreshPanels();
-        return;
-
-      case 'selectModel': {
-        const written = await management.setSelection(
-          request.level,
-          request.key,
-          request.modelId
-        );
-        // Announced only when a selection was actually written. `setSelection`
-        // refuses a model the catalogue does not carry, and saying "now in use"
-        // about a refusal would be the panel lying about its own state.
-        if (written) {
-          providersView?.setNotice(
-            selectionSetNotice(
-              management.catalog.get(request.modelId)?.name ?? request.modelId,
-              request.level,
-              request.key
-            )
-          );
-        }
-        refreshPanels();
-        return;
-      }
-
-      case 'clearSelection': {
-        const cleared = await management.setSelection(request.level, request.key, null);
-        if (cleared) {
-          providersView?.setNotice(selectionClearedNotice(request.level, request.key));
-        }
-        refreshPanels();
-        return;
-      }
-
-      case 'applyAdvice': {
-        const applied = await management.setSelection('role', request.roleId, request.modelId);
-        if (applied) {
-          providersView?.setNotice(
-            selectionSetNotice(
-              management.catalog.get(request.modelId)?.name ?? request.modelId,
-              'role',
-              request.roleId
-            )
-          );
-        }
-        refreshPanels();
-        return;
-      }
-
-      default:
-        // Every other type is handled by the panel itself and never reaches here.
-        logger.warn(`PairPilot received an unhandled management request: ${request.type}`);
-        return;
-    }
-  }
-
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(
-      ProviderManagementProvider.viewType,
-      providersView,
-      { webviewOptions: { retainContextWhenHidden: false } }
-    ),
     vscode.window.registerWebviewViewProvider(CostDashboardProvider.viewType, costView, {
       webviewOptions: { retainContextWhenHidden: false },
     })
@@ -485,6 +593,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       orchestrator.setNotice(`Added ${relative} to the context for your next request.`);
     },
     revealOutput: () => output.show(true),
+    revealReview: async () => {
+      await vscode.commands.executeCommand('pairpilot.reviewWaitingFile');
+    },
     newSession: () => {
       if (orchestrator.machine.isBusy()) {
         void vscode.window.showWarningMessage(
@@ -527,8 +638,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   registerManagementCommands(context, {
     management,
-    providersView,
     costView,
+    refreshStatusBar: () => statusBar?.refresh(),
     logger,
   });
 

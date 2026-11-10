@@ -173,6 +173,14 @@ export interface TurnPromptInput {
   /** The proposal being revised, when responding to change requests. */
   previousProposal?: { filePath: string; operation: OperationType; code: string };
   /**
+   * The project roadmap, already rendered by `renderForPrompt`.
+   *
+   * Present only when a `ROADMAP.md` governs the project. It replaces the
+   * model's own idea of "what next" with the developer's, which is the whole
+   * point: a roadmap that the model cannot see is a suggestion, not a plan.
+   */
+  roadmap?: string;
+  /**
    * What the model should answer with this turn.
    *
    * A hint, not a gate: the model may always choose a different valid type, and
@@ -257,6 +265,20 @@ export function buildProposalPrompt(input: TurnPromptInput): string {
 
   if (input.feedback) {
     sections.push(`The developer's requested changes:\n${input.feedback}`);
+  }
+
+  if (input.roadmap) {
+    // Placed after the feedback and before the instruction, so a revision's
+    // correction is read first and the roadmap's position is read as context
+    // for it rather than as a competing order.
+    sections.push(
+      [
+        input.roadmap,
+        '',
+        'Follow this roadmap. If the developer names a different file, follow the developer — the roadmap is the plan, not a constraint on what they may ask for.',
+        'Comments in the code you write: explain *what* and *why* in Persian, and write the comment syntax of the target language (//, /* */, #). Say what a class or method is responsible for, what the key logic does, and what it depends on. Be useful rather than exhaustive: a comment on every line is noise, and a file with no explanation is a puzzle.',
+      ].join('\n')
+    );
   }
 
   sections.push(`The developer's instruction:\n${input.task}`);
