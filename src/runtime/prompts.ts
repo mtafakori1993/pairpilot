@@ -156,6 +156,69 @@ Describing a directory layout is not creating it. Code is written only when the
 developer asks for code, and the request for this turn states which of these
 applies.`;
 
+/**
+ * Everything a revision turn must be told.
+ *
+ * Separate from `TurnPromptInput` because a revision is a different operation
+ * from a first proposal, and the prompt has to say so. A revision is asked for
+ * by a developer looking at a file that already exists, and the model's job is
+ * to change *that file* — not to regenerate an implementation of the original
+ * task from scratch, which is what a prompt carrying only the task and the
+ * previous code produces.
+ *
+ * Every field here is one of the things a revision cannot be written correctly
+ * without:
+ *
+ *  - `task` — what was originally asked for, so the revision stays on subject.
+ *  - `filePath` — the one file this revision is about. A revision is scoped, and
+ *    a reply that changes some other file is not the revision that was asked for.
+ *  - `currentContent` — what the file holds **now**. This is the content the
+ *    model must read and modify. Without it the model revises its memory of a
+ *    file the developer may have edited since.
+ *  - `reviewedContent` — the code as reviewed and approved, the thing being
+ *    changed. For a `create` that was rolled back this is the only copy that
+ *    exists anywhere, so it cannot be reconstructed from disk.
+ *  - `previousContentHash` — the approval binding, so the reply can be tied back
+ *    to an exact set of bytes rather than to "the file".
+ *  - `feedback` — the developer's own words, which are the actual instruction.
+ *  - `architecture` — what this file depends on and what depends on it, so a
+ *    revision does not quietly break a caller.
+ */
+export interface RevisionPromptInput {
+  /** The developer's original instruction, verbatim. */
+  readonly task: string;
+  /** The exact file path this revision is about. */
+  readonly filePath: string;
+  /** `create` or `update`, as the file was originally proposed. */
+  readonly operation: OperationType;
+  /**
+   * The file's content as it stands now, or `null` when there is no file.
+   *
+   * Read from disk at the moment the request goes out rather than carried from
+   * the proposal, because the point of a revision is to change what is really
+   * there.
+   */
+  readonly currentContent: string | null;
+  /** The code the developer reviewed and asked to have changed. */
+  readonly reviewedContent: string;
+  /** SHA-256 binding the reviewed content to the approval that produced it. */
+  readonly previousContentHash: string;
+  /** The developer's feedback: the instruction this turn exists to satisfy. */
+  readonly feedback: string;
+  /** Workspace-relative paths this file depends on. */
+  readonly dependencies: readonly string[];
+  /** Workspace-relative paths that depend on this file, when known. */
+  readonly dependents: readonly string[];
+  /**
+   * Set when the developer edited the file themselves after the review.
+   *
+   * Its presence changes the instruction: the file on disk is what they want
+   * revised, and the reviewed code is history. Leaving it out would have the
+   * model "restore" lines the developer deliberately changed.
+   */
+  readonly editedSinceReview: boolean;
+}
+
 /** Everything the runtime needs to build one user turn. */
 export interface TurnPromptInput {
   /** The developer's instruction, verbatim. */
@@ -172,6 +235,15 @@ export interface TurnPromptInput {
   feedback?: string;
   /** The proposal being revised, when responding to change requests. */
   previousProposal?: { filePath: string; operation: OperationType; code: string };
+  /**
+   * The revision this turn is: the dedicated revision contract.
+   *
+   * When present it *replaces* `previousProposal` and `feedback` rather than
+   * adding to them. Two descriptions of the same revision in one prompt is how
+   * the model ends up answering the shorter one — and the shorter one is the
+   * footnote, which never named the file's current content.
+   */
+  revision?: RevisionPromptInput;
   /**
    * The project roadmap, already rendered by `renderForPrompt`.
    *
@@ -253,6 +325,10 @@ export function buildProposalPrompt(input: TurnPromptInput): string {
     );
   }
 
+  if (input.revision) {
+    sections.push(buildRevisionSection(input.revision));
+  }
+
   if (input.previousProposal) {
     sections.push(
       [
@@ -263,7 +339,7 @@ export function buildProposalPrompt(input: TurnPromptInput): string {
     );
   }
 
-  if (input.feedback) {
+  if (input.feedback && !input.revision) {
     sections.push(`The developer's requested changes:\n${input.feedback}`);
   }
 
@@ -334,6 +410,94 @@ export function buildAdvisorPrompt(input: {
 }
 
 /**
+ * The revision section: what a revision turn is actually told.
+ *
+ * A revision is not "the first proposal, again". It is a targeted change to one
+ * file that already exists in the developer's editor, and the model cannot make
+ * it without being told what that file says *now*. The reported failure — a
+ * revision that came back as a summary with no `changes` — is downstream of a
+ * prompt that described the task and the old code and left the model to guess
+ * which file it was looking at and what state it was in.
+ *
+ * So this states, in order: what is being revised, the file it is, what the file
+ * holds right now, what was reviewed, the hash that binds the two, what the file
+ * sits among, and then the developer's own words last — closest to the request,
+ * because that is the instruction the reply must satisfy.
+ *
+ * `currentContent` and `reviewedContent` are both sent even when they are equal.
+ * A model shown one of them has to infer the other, and the two inferences it
+ * can make are both wrong in a way that writes code: given only the reviewed
+ * code it regenerates an implementation that ignores the developer's edits, and
+ * given only the current file it rewrites lines that were deliberately added.
+ * Labelling them separately is what lets it tell "restore this" from "keep this".
+ */
+function buildRevisionSection(input: RevisionPromptInput): string {
+  const parts: string[] = [
+    'This turn is a REVISION of one specific file. You are not being asked for a new implementation.',
+    `The original task was:\n${input.task}`,
+    `The file to revise is exactly: ${input.filePath}`,
+    'Change only that file. Do not rename it, do not move it, and do not rewrite parts of it the developer did not mention.',
+  ];
+
+  if (input.currentContent === null) {
+    parts.push(
+      [
+        `"${input.filePath}" is NOT on disk at the moment this request is being made.`,
+        'The code below under "the version you reviewed" is the only copy of it that exists, so revise that.',
+      ].join('\n')
+    );
+  } else if (input.editedSinceReview) {
+    parts.push(
+      [
+        `The developer has edited "${input.filePath}" since reviewing your proposal, so the CURRENT CONTENT below is what the file really says.`,
+        'Treat it as the source of truth: keep their edits, change only what the feedback asks for, and do not restore lines they removed.',
+      ].join('\n')
+    );
+  } else {
+    parts.push(
+      `"${input.filePath}" is on disk and matches the version you proposed. The current content below is what you are revising.`
+    );
+  }
+
+  if (input.currentContent !== null) {
+    parts.push(
+      `Current content of ${input.filePath}, as it is on disk right now:\n\`\`\`\n${input.currentContent}\n\`\`\``
+    );
+  }
+
+  parts.push(
+    `The version you reviewed and proposed (approved under content hash ${input.previousContentHash}):\n\`\`\`\n${input.reviewedContent}\n\`\`\``
+  );
+
+  if (input.dependencies.length > 0 || input.dependents.length > 0) {
+    parts.push(
+      'Surrounding architecture, so the revision does not break a caller:\n' +
+        `- "${input.filePath}" depends on: ${
+          input.dependencies.length > 0 ? input.dependencies.join(', ') : '(nothing in the workspace)'
+        }\n` +
+        `- These files depend on "${input.filePath}": ${
+          input.dependents.length > 0 ? input.dependents.join(', ') : '(nothing currently imports it)'
+        }`
+    );
+  }
+
+  parts.push(
+    [
+      'How to answer:',
+      `- Return a "code_proposal" with exactly one change, for "${input.filePath}".`,
+      '- Its "content" MUST be the COMPLETE revised file — every line, in order, exactly as it should appear on disk afterwards. Never a diff, never a fragment, never a placeholder such as "// rest of the file unchanged".',
+      `- Its "operation" MUST be exactly "${input.operation}".`,
+      '- Apply the developer\'s feedback to the file above and change nothing else. If the feedback is fully satisfied by the file as it stands, say so in "message" and still return the file unchanged.',
+      '- If you genuinely cannot make the change, answer with "clarification_request" and ask the one question that blocks you.',
+    ].join('\n')
+  );
+
+  parts.push(`The developer's feedback — this is the instruction to satisfy:\n${input.feedback}`);
+
+  return parts.join('\n\n');
+}
+
+/**
  * Build the corrective prompt for a reply that failed validation.
  *
  * The point of a retry is that it can succeed. "Your reply was invalid, try
@@ -349,7 +513,10 @@ export function buildAdvisorPrompt(input: {
  * minimum: the four fields every change must carry, in the spelling the host
  * parses.
  */
-export function buildCorrectionPrompt(issues: readonly { path: string; message: string }[]): string {
+export function buildCorrectionPrompt(
+  issues: readonly { path: string; message: string }[],
+  options: { revision?: { filePath: string; operation: OperationType } } = {}
+): string {
   const lines = [
     'Your previous reply was valid JSON, but it did not match the PairPilot response contract, so nothing was written.',
     '',
@@ -361,9 +528,18 @@ export function buildCorrectionPrompt(issues: readonly { path: string; message: 
   if (issues.length > 12) {
     lines.push(`- …and ${issues.length - 12} more problems of the same kind.`);
   }
+  const revision = options.revision;
+  // A revised reply has one more rule the generic shape cannot express: it must
+  // name the file being revised. A correction that restated only the generic
+  // shape is how a model "fixes" an invalid revision by proposing a different
+  // file — which parses, validates, and writes something nobody asked for.
+  const examplePath = revision?.filePath ?? 'src/Example.php';
+  const exampleOperation = revision?.operation ?? 'create';
   lines.push(
     '',
-    'This is the exact structure a code proposal must have:',
+    revision
+      ? `This is a revision of "${revision.filePath}", so the corrected reply must contain exactly one change, for that path:`
+      : 'This is the exact structure a code proposal must have:',
     '',
     '{',
     `  "protocol_version": "${PAIRPILOT_PROTOCOL_VERSION}",`,
@@ -371,8 +547,8 @@ export function buildCorrectionPrompt(issues: readonly { path: string; message: 
     '  "message": "One sentence about the whole proposal.",',
     '  "changes": [',
     '    {',
-    '      "file": "src/Example.php",',
-    '      "operation": "create",',
+    `      "file": "${examplePath}",`,
+    `      "operation": "${exampleOperation}",`,
     '      "description": "One sentence about this file.",',
     '      "content": "<?php\\n\\n// the complete file, every line\\n"',
     '    }',
@@ -380,6 +556,12 @@ export function buildCorrectionPrompt(issues: readonly { path: string; message: 
     '}',
     '',
     'Every entry in "changes" needs all four of those fields, spelled exactly that way. "file" is the workspace-relative path; "operation" is "create" or "update"; "content" is the complete final file, never a fragment or a placeholder.',
+    ...(revision
+      ? [
+          '',
+          `If you cannot make the requested change to "${revision.filePath}", answer with a "clarification_request" asking the one question that blocks you. Do not answer with a "chat_response" describing the change, and do not propose a different file.`,
+        ]
+      : []),
     '',
     'Reply again with ONE complete, corrected JSON object and nothing else. Do not explain the correction, do not add markdown fences, and do not omit the parts that were already correct.'
   );

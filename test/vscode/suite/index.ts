@@ -814,6 +814,196 @@ const cases: Case[] = [
   },
 
   {
+    name: 'a revision replaces the revised file in the real editor and leaves its sibling alone',
+    async run() {
+      const root = requireWorkspaceRoot();
+      const guard = new PathGuard(root, { allowSensitiveFiles: false });
+      const batchDir = path.join(root, BATCH_DIR);
+
+      await closeBatchEditors();
+      fs.rmSync(batchDir, { recursive: true, force: true });
+
+      // Two files of the batch are written, so the developer has a real review
+      // open on the first while the second already sits on disk. The revision
+      // happens *after* that, which is the only ordering in which "revise this
+      // one" and "do not touch that one" are different claims.
+      const set = new ProposalValidator(guard).validateChangeSet(batchMessage());
+      const batch = BatchQueue.create(set);
+      batch.authorizeRemaining();
+      const revised = set.changes[0]!;
+      const sibling = set.changes[1]!;
+      const siblingOnDisk = await writeOneFromBatch(batch, sibling, guard);
+      const revisedOnDisk = await writeOneFromBatch(batch, revised, guard);
+
+      const decisions: string[] = [];
+      const review = new EditorReview({
+        decide: (_session, result) => {
+          decisions.push(`${result.outcome.decision}:${result.outcome.sessionId}`);
+        },
+        logger,
+      });
+
+      try {
+        await review.openReview({
+          sessionId: 'suite-revision-1',
+          relativePath: revised.relativePath,
+          absolutePath: revisedOnDisk.absolutePath,
+          operation: 'create',
+          description: 'The file the developer is reviewing.',
+          rationale: 'The suite asks for a change to this file and nothing else.',
+          contentHash: revised.contentHash,
+          binding: { proposalVersion: batch.proposalVersion },
+          documentLine: 0,
+          position: { index: 1, total: 2 },
+        });
+        const openedDocument = vscode.window.activeTextEditor?.document;
+        assert.ok(openedDocument, 'opening a review should reveal a real document');
+        assert.strictEqual(
+          openedDocument.getText(),
+          revisedOnDisk.onDisk,
+          'the review should open on the code that was written'
+        );
+
+        // The model's reply to "change this file". It is validated and merged by
+        // the same code the extension uses, so the batch's answer to a revision —
+        // one file replaced, six untouched, one version forward — is the real one.
+        const change: ProposalChange = {
+          id: 'change-revision',
+          file: revised.relativePath,
+          operation: 'update',
+          description: 'The revised file.',
+          content: `// ${path.basename(revised.relativePath)} — revised\nexport const which = 'revised';\n`,
+          dependencies: [],
+          risk: 'low',
+        };
+        const replySet = new ProposalValidator(guard).validateChangeSet({
+          protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+          type: 'code_proposal',
+          message: 'Revised that one file.',
+          task: { title: 'Revision', description: 'One file, revised.' },
+          changes: [change],
+        } as CodeProposalMessage);
+        const revisedCode = replySet.changes[0]!.assembledCode;
+        assert.notStrictEqual(
+          revisedCode,
+          revisedOnDisk.onDisk,
+          'the revised content must differ, or this case proves nothing'
+        );
+
+        const versionBefore = batch.proposalVersion;
+        const merged = batch.mergeRevision(replySet, revised.relativePath);
+        assert.deepStrictEqual(merged.revised, [revised.relativePath], 'only the asked-about file');
+        assert.deepStrictEqual(merged.added, [], 'a revision of a file in the batch adds nothing');
+        assert.strictEqual(
+          batch.proposalVersion,
+          versionBefore + 1,
+          'the batch should move forward exactly one version'
+        );
+
+        // Stream it into the editor the way the workflow does: the same
+        // `LiveWriter`, the same per-path lock, an `update` over the file the
+        // developer is looking at. This is spec section 7's "stream the revised
+        // content into the actual VS Code editor using the existing in-editor
+        // review workflow" — the part no unit test can reach, because the
+        // document is real.
+        assert.ok(batch.claimWrite(revised.relativePath), 'the lock should be free for the rewrite');
+        batch.markWriting(revised.relativePath);
+        const writer = new LiveWriter({ guard, logger });
+        let documentText = '';
+        try {
+          const begun = await writer.begin(revised.relativePath, 'update', {
+            approvedCreate: false,
+            expectedTotal: revisedCode.length,
+          });
+          for (const chunk of revisedCode.match(/[\s\S]{1,16}/g) ?? []) {
+            writer.push(chunk);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          const outcome = await writer.complete();
+          assert.strictEqual(
+            outcome.status,
+            'completed',
+            `the revised write did not complete: ${JSON.stringify(outcome)}`
+          );
+          documentText = begun.document.getText();
+        } finally {
+          batch.releaseWrite(revised.relativePath);
+        }
+
+        assert.strictEqual(
+          documentText,
+          revisedCode,
+          'the editor must end up holding the revised file and nothing else'
+        );
+        assert.strictEqual(
+          fs.readFileSync(revisedOnDisk.absolutePath, 'utf8'),
+          revisedCode,
+          'the revised bytes must be on disk, not only in the buffer'
+        );
+
+        // The review opens on the revised content in the same real document —
+        // this is the acceptance criterion: revise the file, review the updated
+        // code in the same editor, with no contract error in between.
+        await review.openReview({
+          sessionId: 'suite-revision-2',
+          relativePath: revised.relativePath,
+          absolutePath: revisedOnDisk.absolutePath,
+          operation: 'update',
+          description: 'The revised file.',
+          rationale: null,
+          contentHash: replySet.changes[0]!.contentHash,
+          binding: { proposalVersion: batch.proposalVersion },
+          documentLine: 0,
+          position: { index: 1, total: 2 },
+        });
+        const reopenedDocument = vscode.window.activeTextEditor?.document;
+        assert.ok(reopenedDocument, 'the revised review should reveal a real document');
+        assert.strictEqual(
+          reopenedDocument.getText(),
+          revisedCode,
+          'the review of a revision must show the revised code'
+        );
+        assert.strictEqual(
+          reopenedDocument.uri.fsPath,
+          path.resolve(revisedOnDisk.absolutePath),
+          'a revision must be reviewed in the real editor for that file'
+        );
+        assert.ok(
+          review.findById('suite-revision-2'),
+          'the revised review should be the one now waiting'
+        );
+
+        // The sibling is exactly as it was written: same bytes, same entry. A
+        // revision that reached the batch instead of the file would show up
+        // here, because the batch is what decides which file a write is about.
+        assert.strictEqual(
+          fs.readFileSync(siblingOnDisk.absolutePath, 'utf8'),
+          siblingOnDisk.onDisk,
+          `${sibling.relativePath} was disturbed by the revision of ${revised.relativePath}`
+        );
+        assert.strictEqual(
+          batch.byRelativePath(sibling.relativePath)!.contentHash,
+          sibling.contentHash,
+          "the sibling's review should still be bound to its own content"
+        );
+        assert.strictEqual(
+          batch.byRelativePath(sibling.relativePath)!.status,
+          'completed',
+          'the sibling should still be awaiting its own review'
+        );
+        assert.strictEqual(batch.size, 7, 'the revision must not have resized the batch');
+
+        // And the revision did not quietly approve itself: no decision was taken.
+        assert.deepStrictEqual(decisions, [], 'a revision writes code, it does not decide anything');
+      } finally {
+        review.dispose();
+        await closeBatchEditors();
+        fs.rmSync(batchDir, { recursive: true, force: true });
+      }
+    },
+  },
+
+  {
     name: 'two review sessions cannot write the same path at once',
     async run() {
       const root = requireWorkspaceRoot();

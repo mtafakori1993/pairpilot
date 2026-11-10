@@ -53,10 +53,16 @@ import {
   buildCorrectionPrompt,
   buildProposalPrompt,
   summariseContext,
+  type RevisionPromptInput,
   type TurnPromptInput,
 } from '../runtime/prompts';
 import { interpretTurn, renderMessage } from '../proposals/TurnInterpreter';
 import { ProposalValidator, toValidatedProposal } from '../proposals/ProposalValidator';
+import {
+  differsFromReviewed,
+  revisionStillApplies,
+  type RevisionScope,
+} from '../proposals/RevisionScope';
 import { ApprovalManager, toProposalRecord } from '../proposals/ApprovalManager';
 import { BatchQueue, type BatchFileEntry } from '../proposals/BatchQueue';
 import type { Continuation } from '../roadmap/RoadmapContinuation';
@@ -2221,16 +2227,36 @@ export class Orchestrator {
 
   /** Re-run the turn with the developer's feedback attached. */
   /**
-   * Re-run the turn with the developer's feedback attached.
+   * Re-run the turn with the developer's feedback attached — the revision path.
    *
-   * A revision is code work in a mode that allows proposals, so it asks for a
-   * `code_proposal` outright and gets the same bounded correction loop as the
-   * primary turn: a reply that was valid JSON of the wrong shape — the
-   * summary-shaped `code_proposal` with no `changes` array — is re-requested
-   * with the validator's own complaint, at most `MAX_PROTOCOL_RETRIES` times,
-   * before the turn is failed. Until this loop existed, the revision path made
-   * exactly one request, so the first summary-shaped reply ended the revision
-   * with the contract error and the developer's feedback was lost with it.
+   * ## Why this is not the primary turn
+   *
+   * A revision is a different operation from a first proposal, and 0.4.0's first
+   * fix treated them as one. Three things separate them, and each one is a way
+   * this path failed:
+   *
+   *  - **It is scoped to one file that exists.** The primary turn may propose any
+   *    files the task needs; a revision changes the file the developer was
+   *    looking at, and a reply that proposes a different one has not done the
+   *    revision. `stageProposal` merges it into the batch by path, so the path is
+   *    checked before the reply is applied rather than assumed.
+   *  - **It must revise the file's *current* content.** A `create` that was
+   *    rolled back exists nowhere on disk, and an `update` sits next to a
+   *    pre-existing file. Sending the model only `previous.assembledCode` — which
+   *    is what this method used to do — is what makes it regenerate an unrelated
+   *    implementation instead of amending the one under review. `RevisionScope`
+   *    records both versions and the prompt labels them.
+   *  - **It can go stale while the model thinks.** The developer keeps editing
+   *    during those seconds. Nothing in the primary path can be invalidated that
+   *    way, because nothing has been written yet.
+   *
+   * The correction loop below is shared with the primary turn — a reply that is
+   * valid JSON of the wrong shape is re-requested with the validator's own
+   * complaint, at most `MAX_PROTOCOL_RETRIES` times — but every correction is
+   * built with `buildCorrectionPrompt(..., { revision })`, so a retry restates
+   * *which file* it is correcting. Without that, a model "fixing" an invalid
+   * revision can satisfy the generic shape by proposing some other file, which
+   * parses, validates, and writes something nobody asked for.
    */
   private async retryWithFeedback(
     previous: ValidatedProposal,
@@ -2250,6 +2276,26 @@ export class Orchestrator {
     const assembled =
       this.lastAssembled ?? (await this.deps.workspace.assemble([...this.pinnedContext], config.budget));
     const task = this.currentTask ?? 'Revise the previous proposal.';
+
+    // Captured once, before the first request goes out. `onDiskAtRequest` is read
+    // *now* — after any rollback the request path performed — because that is the
+    // state the revised write will be expected to replace, and the thing a later
+    // edit has to be compared against.
+    const scope: RevisionScope = {
+      relativePath: previous.relativePath,
+      absolutePath: previous.absolutePath,
+      reviewedContent: previous.assembledCode,
+      reviewedHash: previous.contentHash,
+      onDiskAtRequest: this.readFileQuietly(previous.absolutePath),
+      batchVersion: this.batch?.view().proposalVersion ?? null,
+      feedback,
+    };
+    this.deps.logger.info(
+      `Revision of ${scope.relativePath} requested (batch version ${scope.batchVersion ?? 'none'}, ` +
+        `${scope.onDiskAtRequest === null ? 'not on disk' : 'on disk'}).`
+    );
+
+    const revisionCorrection = { filePath: scope.relativePath, operation: previous.proposal.operation };
 
     this.machine.transition(PairPilotState.PROPOSING, 'requesting a revision');
     this.deps.notify();
@@ -2273,13 +2319,11 @@ export class Orchestrator {
         // model to narrate instead, which is how a revision turn produced the
         // same summary-shaped refusal as the original bug.
         typeHint: codeProposalDemandHint(),
-        feedback,
+        // The dedicated revision contract, not the `previousProposal` footnote.
+        // Two descriptions of one revision is how the model answers the shorter
+        // one — and the footnote never carried the file's current content.
+        revision: await this.describeRevision(scope),
         ...(correction !== undefined ? { correction } : {}),
-        previousProposal: {
-          filePath: previous.relativePath,
-          operation: previous.proposal.operation,
-          code: previous.assembledCode,
-        },
       });
 
       const result = await this.runRuntimeTurn({
@@ -2321,18 +2365,75 @@ export class Orchestrator {
       if (interpretation.kind === 'failure') {
         lastFailure = interpretation.failure;
         if (interpretation.retryable && attempt < MAX_PROTOCOL_RETRIES) {
-          correction = buildCorrectionPrompt(interpretation.failure.issues);
+          correction = buildCorrectionPrompt(interpretation.failure.issues, {
+            revision: revisionCorrection,
+          });
           continue;
         }
-        this.failTurn(lastFailure);
+        this.failRevisionTurn(lastFailure, scope);
         return;
       }
       if (interpretation.kind !== 'proposal') {
+        // A reply of another type is a valid answer the developer can read, but it
+        // is not the revision they asked for, and the file keeps its content.
         this.appendAssistant(record.id, renderMessage(interpretation.message), result.usage);
         this.machine.tryTransition(PairPilotState.REJECTED, 'the revision was not a proposal');
         this.machine.tryTransition(PairPilotState.IDLE, 'turn finished');
-        this.notice =
-          'The AI answered with words rather than a new proposal, so nothing was written. Its reply is above.';
+        this.notice = `The AI answered with ${
+          interpretation.message.type
+        } rather than a revised "${scope.relativePath}", so nothing was written. Its reply is above.`;
+        this.currentStep = null;
+        this.deps.notify();
+        return;
+      }
+
+      // The reply is a proposal. Two checks stand between it and the workspace,
+      // and both are specific to a revision: first that it is about the file that
+      // was being revised, then that the file has not moved since the request.
+      const target = interpretation.message.changes.find(
+        (change) => normPath(change.file) === scope.relativePath
+      );
+      if (!target) {
+        const proposed = interpretation.message.changes.map((change) => change.file).join(', ');
+        const issues: ProtocolIssue[] = [
+          {
+            path: '/changes',
+            code: 'invalid_value',
+            message:
+              `A revision of "${scope.relativePath}" must contain a change for that exact path, but this reply ` +
+              `proposed ${proposed || 'nothing'}. Revise "${scope.relativePath}" itself.`,
+          },
+        ];
+        lastFailure = {
+          ok: false,
+          kind: 'schema',
+          reason: `The revision did not mention "${scope.relativePath}", so it was not applied.`,
+          issues,
+          raw: result.text,
+        };
+        if (attempt < MAX_PROTOCOL_RETRIES) {
+          correction = buildCorrectionPrompt(issues, { revision: revisionCorrection });
+          continue;
+        }
+        this.failRevisionTurn(lastFailure, scope);
+        return;
+      }
+
+      // Stale check, immediately before anything is applied. Doing it here rather
+      // than at request time is the point: the model has just spent seconds
+      // thinking, and this is the last moment at which the file's real content is
+      // knowable. A file edited in that window keeps the developer's edits and
+      // loses the revision — never the other way round.
+      const staleness = revisionStillApplies(scope, {
+        onDisk: this.readFileQuietly(scope.absolutePath),
+        batchVersion: this.batch?.view().proposalVersion ?? null,
+      });
+      if (staleness.stale) {
+        this.deps.logger.warn(`Revision of ${scope.relativePath} refused as stale: ${staleness.reason}`);
+        this.machine.tryTransition(PairPilotState.REJECTED, 'the revision went stale');
+        this.machine.tryTransition(PairPilotState.IDLE, 'turn finished');
+        this.error = staleness.reason;
+        this.notice = 'Nothing was written. The file is exactly as you left it.';
         this.currentStep = null;
         this.deps.notify();
         return;
@@ -2350,7 +2451,7 @@ export class Orchestrator {
         raw: result.text,
       };
       if (attempt < MAX_PROTOCOL_RETRIES && stageRetryable(staged.issues)) {
-        correction = buildCorrectionPrompt(staged.issues);
+        correction = buildCorrectionPrompt(staged.issues, { revision: revisionCorrection });
         continue;
       }
       this.failTurn(lastFailure);
@@ -2358,8 +2459,93 @@ export class Orchestrator {
     }
 
     if (lastFailure) {
-      this.failTurn(lastFailure);
+      this.failRevisionTurn(lastFailure, scope);
     }
+  }
+
+  /**
+   * End a revision that never produced an applicable change.
+   *
+   * The wording matters more here than on the primary path. A failed revision
+   * leaves the developer holding a file they already asked to change, and the
+   * one thing they need to know is that *the file is untouched* — otherwise the
+   * honest reading of "the revision was not applied" is "something was applied,
+   * and something else was not". So the failure is stated first, the guarantee
+   * second, and the file is named.
+   */
+  private failRevisionTurn(failure: ProtocolParseFailure, scope: RevisionScope): void {
+    this.failTurn(failure);
+    this.notice = `"${scope.relativePath}" is unchanged — no revision was applied to it.`;
+  }
+
+  /**
+   * Build the revision contract for the prompt.
+   *
+   * The current content is re-read at the moment of each request rather than
+   * reused from the scope, so a developer who edits the file between a failed
+   * attempt and its correction has that edit reflected in the retry. The window
+   * is short, but it is the same window that makes the stale check necessary, and
+   * sending a correction against content the model has already been told is
+   * current — when it no longer is — produces exactly the "restore the lines I
+   * deleted" failure the revision contract exists to prevent.
+   *
+   * The operation follows the filesystem rather than the original proposal. A
+   * revised reply is written over whatever is at the path now, and the validator
+   * refuses a `create` over an existing file and an `update` over a missing one —
+   * so a revision of a `create` whose file has since appeared must be sent as an
+   * `update`, or the whole revision is refused for a reason that has nothing to
+   * do with the developer's feedback.
+   */
+  private async describeRevision(scope: RevisionScope): Promise<RevisionPromptInput> {
+    const current = this.readFileQuietly(scope.absolutePath);
+    return {
+      task: this.currentTask ?? 'Revise the previous proposal.',
+      filePath: scope.relativePath,
+      operation: current === null ? 'create' : 'update',
+      currentContent: current,
+      reviewedContent: scope.reviewedContent,
+      previousContentHash: scope.reviewedHash,
+      feedback: scope.feedback,
+      dependencies: await this.dependenciesOf(scope.relativePath),
+      dependents: await this.dependentsOf(scope.relativePath),
+      editedSinceReview: differsFromReviewed(scope, current),
+    };
+  }
+
+  /** Workspace paths the revised file declares a dependency on. */
+  private async dependenciesOf(relativePath: string): Promise<string[]> {
+    const entry = this.batch?.byRelativePath(relativePath);
+    if (entry) {
+      return [...entry.change.change.dependencies];
+    }
+    return (
+      this.changeQueue.find((change) => change.relativePath === relativePath)?.change.dependencies ?? []
+    );
+  }
+
+  /**
+   * Workspace paths that name the revised file as a dependency.
+   *
+   * Read from the batch and the pending set only — a full workspace scan would
+   * mean reading every file the developer owns to answer a question with a
+   * short, bounded answer. The batch is exactly the set of files in play, so its
+   * edges are the ones a revision can break.
+   */
+  private async dependentsOf(relativePath: string): Promise<string[]> {
+    const inPlay = this.batch?.all().map((entry) => entry.change) ?? this.changeQueue;
+    const dependents: string[] = [];
+    for (const change of inPlay) {
+      if (change.relativePath === relativePath) {
+        continue;
+      }
+      const declares = change.change.dependencies.some(
+        (dependency) => normPath(dependency) === relativePath
+      );
+      if (declares) {
+        dependents.push(change.relativePath);
+      }
+    }
+    return dependents;
   }
 
   acceptRecommendation(): void {
@@ -2986,6 +3172,20 @@ export class Orchestrator {
 /* -------------------------------------------------------------------------- */
 /* Module-level helpers                                                       */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Compare two paths as paths rather than as strings.
+ *
+ * A model may legitimately write `./src/User.php` or `src\\User.php` for the same
+ * file, and the validator normalises both before they reach the workspace. So the
+ * revision's own "is this change about the file I asked about?" check has to
+ * normalise too: comparing the raw spellings would reject a perfectly correct
+ * revision, and reject it with a message claiming the model proposed some other
+ * file.
+ */
+function normPath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\.\//, '');
+}
 
 /** Normalise line endings so a CRLF conversion is not mistaken for tampering. */
 export function normaliseNewlines(value: string): string {

@@ -97,6 +97,15 @@ class ScriptedAI {
   readonly requests: AITurnRequest[] = [];
   private readonly replies: string[];
   private index = 0;
+  /**
+   * Run just before a reply is handed back, given the attempt's index.
+   *
+   * The one thing a scripted reply cannot do on its own is simulate the real
+   * world moving while the model thinks — which is exactly the window a revision
+   * goes stale in. A test that needs the developer to edit the file mid-revision
+   * installs this, and the edit lands between the request and the answer.
+   */
+  beforeReply: ((prompt: string, attempt: number) => void) | null = null;
 
   constructor(...replies: string[]) {
     this.replies = replies;
@@ -110,8 +119,11 @@ class ScriptedAI {
   startTurn(request: AITurnRequest): AITurnHandle {
     this.requests.push(request);
     this.prompts.push(request.prompt);
+    const attempt = this.index;
     const text = this.replies[Math.min(this.index, this.replies.length - 1)] ?? '';
     this.index += 1;
+
+    this.beforeReply?.(request.prompt, attempt);
 
     let cancelled = false;
     const result: Promise<TurnResult> = Promise.resolve({
@@ -1421,5 +1433,425 @@ describe('a revision whose reply misses the contract', () => {
     expect(orchestrator.errorValue).toMatch(/changes/i);
     expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
     expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The revision contract                                                      */
+/*                                                                            */
+/* A revision is not "the first proposal again". It is a targeted change to   */
+/* one file that already exists, and the twelve cases the bug report named     */
+/* are grouped here by which half of that sentence they pin: what the prompt   */
+/* is told, which replies are accepted as revisions, and what is allowed to    */
+/* reach the workspace.                                                       */
+/* -------------------------------------------------------------------------- */
+
+describe('the revision contract', () => {
+  /**
+   * A valid revision reply for one file.
+   *
+   * `operation` is a parameter because a revision's operation follows the
+   * filesystem, not the original proposal: the same content is a `create` when
+   * the path is empty and an `update` when something is already there, and the
+   * validator refuses the wrong one outright.
+   */
+  function revisionReply(
+    content = '<?php\n\nfinal class User\n{\n    public function __construct(public readonly string $name) {}\n}\n',
+    operation: 'create' | 'update' = 'create'
+  ): string {
+    return JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Tightened the class.',
+      changes: [
+        {
+          file: 'src/User.php',
+          operation,
+          description: 'A final PHP user entity',
+          content,
+        },
+      ],
+    });
+  }
+
+  /** Stage the reported proposal and open its permission gate. */
+  async function atGate(ai: ScriptedAI): Promise<{
+    orchestrator: Orchestrator;
+    requests: OrchestratorWritePermissionRequest[];
+  }> {
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+    await orchestrator.submitTask('Create a PHP User class');
+    return { orchestrator, requests };
+  }
+
+  /** The file before the proposal: something is already at the path. */
+  const PRE_EXISTING = '<?php\n\n// pre-existing\nfinal class User {}\n';
+
+  /** What the proposal says the file should become. */
+  const PROPOSED = '<?php\n\nfinal class User\n{\n    // proposed\n}\n';
+
+  /** What the model sends back when the developer asks for a change. */
+  const REVISED_BY_MODEL = '<?php\n\nfinal class User\n{\n    // revised\n}\n';
+
+  /**
+   * A proposal that *updates* a file already on disk.
+   *
+   * The tests about what a revision is told need a path that holds something
+   * before the proposal, because that is the only way the current content and the
+   * reviewed content can differ. A `create` cannot be used for it: the validator
+   * refuses a create over an existing file — correctly — and the turn ends before
+   * there is anything to revise.
+   */
+  function updateReply(content: string): string {
+    return JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Rewrote the User class.',
+      changes: [
+        {
+          file: 'src/User.php',
+          operation: 'update',
+          description: 'The User entity.',
+          content,
+        },
+      ],
+    });
+  }
+
+  /** A one-change proposal for an arbitrary path, for batch revisions. */
+  function oneFileReply(file: string, content: string, operation: 'create' | 'update' = 'create'): string {
+    return JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: `Revised ${file}.`,
+      changes: [{ file, operation, description: `The revised ${file}.`, content }],
+    });
+  }
+
+  /** Stage an update of an existing file and open its permission gate. */
+  async function atGateOverExisting(
+    ai: ScriptedAI,
+    onDisk: string = PRE_EXISTING
+  ): Promise<{ orchestrator: Orchestrator; requests: OrchestratorWritePermissionRequest[] }> {
+    fs.writeFileSync(path.join(root, 'src', 'User.php'), onDisk, 'utf8');
+    const requests: OrchestratorWritePermissionRequest[] = [];
+    const orchestrator = makeOrchestrator(ai, undefined, (request) => {
+      requests.push(request);
+    });
+    await orchestrator.submitTask('Create a PHP User class');
+    return { orchestrator, requests };
+  }
+
+  it('applies a revision that carries valid changes', async () => {
+    const ai = new ScriptedAI(REPORTED_REPLY, revisionReply());
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.relativePath).toBe('src/User.php');
+    // A new binding: the developer is being asked about different bytes.
+    expect(requests[1]!.contentHash).not.toBe(requests[0]!.contentHash);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('refuses a revision reply with no changes array at all', async () => {
+    const summary = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Tightened the class as requested.',
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, summary, summary, summary);
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toMatch(/non-empty "changes"/);
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('refuses a revision reply whose changes array is empty', async () => {
+    const empty = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Nothing needed changing.',
+      changes: [],
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, empty, empty, empty);
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toMatch(/changes/i);
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('shows a chat_response as an answer rather than applying it as a revision', async () => {
+    // A model that answers in words has answered. The turn must end with the
+    // developer reading it — not with the contract error, and not with a write.
+    const chat = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'chat_response',
+      message: 'That class is already final, so there is nothing to change.',
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, chat);
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(ai.turnCount).toBe(2);
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.noticeValue).toMatch(/chat_response/);
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    const session = store.getActive()!;
+    expect(
+      session.messages.some((message) => message.text.includes('already final'))
+    ).toBe(true);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('shows a clarification_request rather than treating it as a failed revision', async () => {
+    // The model is entitled to ask. A revision that ends in a question has not
+    // failed — it is waiting on the developer, and saying "the contract was not
+    // met" would be wrong about which side is being waited on.
+    const question = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'clarification_request',
+      message: 'Which visibility should the constructor have?',
+      clarification: { question: 'Public or private constructor?', options: ['public', 'private'] },
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, question);
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    expect(
+      store.getActive()!.messages.some((message) => message.text.includes('Public or private'))
+    ).toBe(true);
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+  });
+
+  it('normalises a nested revision reply into the canonical contract', async () => {
+    // The same shape the original bug was reported against, on the revision
+    // path: the payload one level down under `proposal`.
+    const nested = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Tightened the class.',
+      proposal: {
+        changes: [
+          {
+            file: 'src/User.php',
+            operation: 'create',
+            description: 'A final PHP user entity',
+            content: '<?php\n\nfinal class User {}\n',
+          },
+        ],
+      },
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, nested);
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toBeNull();
+    expect(orchestrator.protocolDiagnostics.recent()[1]!.adaptation).toBe('nested_proposal');
+    expect(orchestrator.machine.state).toBe(PairPilotState.WAITING_FILE_APPROVAL);
+    expect(requests[1]!.relativePath).toBe('src/User.php');
+  });
+
+  it('carries the developer’s feedback verbatim into the revision prompt', async () => {
+    const ai = new ScriptedAI(REPORTED_REPLY, revisionReply());
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(
+      requests[0]!.contentHash,
+      'Make the constructor private and add a getName() method.'
+    );
+
+    const prompt = ai.prompts[1]!;
+    expect(prompt).toContain('Make the constructor private and add a getName() method.');
+    // Labelled as the instruction, not as one more piece of context.
+    expect(prompt).toMatch(/feedback — this is the instruction to satisfy/);
+  });
+
+  it('carries the current on-disk content and the previous approved hash', async () => {
+    // The gap the reported failure left open: the prompt used to carry the
+    // *approved* code and nothing else, so the model revised its memory of a file
+    // rather than the file the developer is looking at. Here the path holds a
+    // developer's own edit before the revision is asked for — the state a
+    // revision prompt has to describe correctly, and the one the old prompt
+    // could not see at all.
+    const HAND_EDITED = '<?php\n\n// edited by hand\nfinal class User {}\n';
+    const ai = new ScriptedAI(updateReply(PROPOSED), revisionReply(HAND_EDITED + '\n', 'update'));
+    const { orchestrator, requests } = await atGateOverExisting(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'add a name property');
+
+    const prompt = ai.prompts[1]!;
+    // The file's real content, exactly as it is now.
+    expect(prompt).toContain('// pre-existing');
+    expect(prompt).toMatch(/Current content of src\/User\.php/);
+    // And the code as reviewed, so the model can tell the two apart.
+    expect(prompt).toContain('// proposed');
+    expect(prompt).toMatch(/the version you reviewed/i);
+    // The hash the approved content is held under, for the audit trail.
+    expect(prompt).toContain(requests[0]!.contentHash);
+    expect(prompt).toMatch(/content hash/i);
+    // The model is told the two differ, so it does not "restore" what it proposed.
+    expect(prompt).toMatch(/edited .* since reviewing/i);
+  });
+
+  it('refuses a revision whose file was edited while the model was thinking', async () => {
+    // The acceptance case the bug report names: the developer keeps typing after
+    // asking for a change. Their edits are the ones that survive.
+    //
+    // The edit lands *during* the revision turn — between the prompt going out
+    // and the reply coming back — which is the only window in which a revision
+    // can go stale without the review layer catching it first. (An edit made
+    // before the request is already refused at the review gate, by the document
+    // fingerprint, so this is the window that was genuinely unguarded.)
+    //
+    // The reply itself is exactly what the prompt asked for — a complete file for
+    // the path under revision. That is what makes this a test of the staleness
+    // rule rather than of the parser: nothing about the reply is wrong, and the
+    // revised bytes are simply no longer the right answer to the file on disk.
+    const ai = new ScriptedAI(updateReply(PROPOSED), updateReply(REVISED_BY_MODEL));
+    const { orchestrator, requests } = await atGateOverExisting(ai);
+    const typedMeanwhile = '<?php\n\n// typed during the revision\nfinal class User {}\n';
+    ai.beforeReply = (_prompt, attempt) => {
+      if (attempt === 1) {
+        fs.writeFileSync(path.join(root, 'src', 'User.php'), typedMeanwhile, 'utf8');
+      }
+    };
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toMatch(/edited after you asked/i);
+    expect(orchestrator.noticeValue).toMatch(/exactly as you left it/i);
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+    // No second permission prompt: the stale reply never reached the gate.
+    expect(requests).toHaveLength(1);
+    // And the developer's own bytes are still on disk, untouched.
+    expect(fs.readFileSync(path.join(root, 'src', 'User.php'), 'utf8')).toBe(typedMeanwhile);
+  });
+
+  it('refuses a revision reply that proposes a different file', async () => {
+    // A reply that satisfies the generic shape by proposing some other file is
+    // not the revision that was asked for, however well-formed it is.
+    const elsewhere = JSON.stringify({
+      protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+      type: 'code_proposal',
+      message: 'Here is a repository instead.',
+      changes: [
+        {
+          file: 'src/UserRepository.php',
+          operation: 'create',
+          description: 'A repository.',
+          content: '<?php\n\nfinal class UserRepository {}\n',
+        },
+      ],
+    });
+    const ai = new ScriptedAI(REPORTED_REPLY, elsewhere, elsewhere, elsewhere);
+    const { orchestrator, requests } = await atGate(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toMatch(/src\/User\.php/);
+    // Corrected rather than accepted: the retry says which file it must be.
+    expect(ai.turnCount).toBe(4);
+    expect(ai.prompts[2]).toContain('src/User.php');
+    expect(fs.existsSync(path.join(root, 'src', 'UserRepository.php'))).toBe(false);
+    // The file being revised is untouched and the batch has no new member.
+    expect(fs.existsSync(path.join(root, 'src', 'User.php'))).toBe(false);
+    expect(orchestrator.batchView!.total).toBe(1);
+  });
+
+  it('never applies a failed revision over the original file', async () => {
+    // The strongest form of the guarantee: a file that exists, a revision that
+    // never validates, and byte-for-byte proof it is unchanged afterwards.
+    //
+    // One summary-shaped reply is enough: `ScriptedAI` repeats its last reply
+    // once the script runs out, so every attempt — the request and both
+    // corrections — answers with the same invalid shape.
+    const ai = new ScriptedAI(
+      updateReply(PROPOSED),
+      JSON.stringify({
+        protocol_version: PAIRPILOT_PROTOCOL_VERSION,
+        type: 'code_proposal',
+        message: 'I would make it final.',
+      })
+    );
+    const { orchestrator, requests } = await atGateOverExisting(ai);
+
+    await orchestrator.requestChangesBeforeWrite(requests[0]!.contentHash, 'make the class final');
+
+    expect(orchestrator.errorValue).toMatch(/non-empty "changes"/);
+    expect(orchestrator.noticeValue).toMatch(/unchanged/i);
+    expect(fs.readFileSync(path.join(root, 'src', 'User.php'), 'utf8')).toBe(PRE_EXISTING);
+    expect(orchestrator.machine.state).toBe(PairPilotState.IDLE);
+  });
+
+  it('revises one file of a batch without disturbing the review of another', async () => {
+    // The batch is why a revision has to be scoped at all. The developer reviews
+    // a set file by file, so asking for a change to the first must not rewrite
+    // the second out from under the review it is still waiting for.
+    //
+    // What is asserted here is the wiring: that a revision asked for at the gate
+    // of a multi-file set is merged into the batch as a revision of *its own*
+    // entry, rather than being re-staged as a fresh proposal of one file. The
+    // content half of the guarantee — that every sibling keeps its hash and its
+    // bytes — belongs to the merge itself, and is pinned there
+    // (`BatchExecution.test.ts`, "replaces only the revised file and leaves the
+    // other six exactly as they were"). This test exists because passing the
+    // right reply to the right merge is a separate thing from the merge being
+    // right.
+    const ENTITY = 'src/Domain/User.php';
+    const REPOSITORY = 'src/Infrastructure/UserRepository.php';
+    const REVISED_ENTITY =
+      '<?php\n\nfinal class User\n{\n    public function __construct(public readonly string $name) {}\n}\n';
+
+    const ai = new ScriptedAI(MULTI_FILE_REPLY, oneFileReply(ENTITY, REVISED_ENTITY));
+    const orchestrator = makeOrchestrator(ai);
+    await orchestrator.submitTask('Create a user module');
+
+    const before = orchestrator.batchView!;
+    expect(before.files.map((file) => file.file)).toEqual([ENTITY, REPOSITORY]);
+    const repositoryBefore = before.files.find((file) => file.file === REPOSITORY)!;
+
+    await orchestrator.requestChangesBeforeWrite(
+      orchestrator.approvals.getPendingHash()!,
+      'give the User a name'
+    );
+
+    // One request, one reply: the revision was satisfied on the first turn. A
+    // revision that quietly re-staged the whole set would show up here as a
+    // second prompt, because staging the reply as a new proposal is exactly what
+    // would leave the sibling's review behind.
+    expect(ai.turnCount).toBe(2);
+    expect(orchestrator.errorValue).toBeNull();
+
+    const after = orchestrator.batchView!;
+    expect(after.total).toBe(2);
+    expect(after.files.map((file) => file.file)).toEqual([ENTITY, REPOSITORY]);
+    expect(after.files.map((file) => file.fileId)).toEqual(before.files.map((file) => file.fileId));
+
+    // The sibling is exactly as it was: same file, same identity, same
+    // operation, still waiting for its own decision.
+    expect(after.files.find((file) => file.file === REPOSITORY)).toEqual(repositoryBefore);
+
+    // And the revised content went to the file under revision, not to the set.
+    const pending = orchestrator.approvals.getPending()!;
+    expect(pending.relativePath).toBe(ENTITY);
+    expect(pending.assembledCode).toBe(REVISED_ENTITY);
   });
 });

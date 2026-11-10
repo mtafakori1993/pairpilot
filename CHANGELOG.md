@@ -4,6 +4,62 @@ All notable changes to PairPilot are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+The revision path, treated as its own pipeline rather than as the initial
+proposal pipeline with a feedback field attached. 0.4.0 gave a revision a
+correction loop but left it asking the question the wrong way: the prompt showed
+the model only the *approved* content, with no notion of what the file holds now
+and no record of which version the developer was looking at, and nothing checked
+the file again between the request going out and the reply coming back.
+
+### Added
+
+- `src/proposals/RevisionScope.ts` — what a revision was asked for, and the pure
+  comparison that decides whether it still applies: the file edited, appeared,
+  deleted or the batch moved on. Tested without an editor, a workspace or a
+  provider, because the revision path is where "it worked when I tried it" is
+  least trustworthy.
+
+### Changed
+
+- **A revision is asked for in its own terms.** `RevisionPromptInput` carries the
+  original task, the exact path, the file's *current* content, the reviewed
+  content and its approval hash, the developer's feedback, and the file's
+  dependencies and dependents — all labelled, because a model shown only the
+  reviewed version regenerates an unrelated implementation and a model shown only
+  the on-disk version rewrites a file it has not read. It replaces the
+  `previousProposal` footnote rather than sitting beside it: two descriptions of
+  one revision is how the model answers the shorter one.
+- **A corrective retry says which file it is correcting.** A "fixed" revision can
+  satisfy the generic shape by proposing some other file, which parses, validates
+  and writes something nobody asked for. A reply for the wrong path is now a
+  retryable contract failure that names the path, and the correction prompt leads
+  with it.
+- **The revised operation follows the filesystem, not the original proposal.** A
+  `create` whose file has since appeared has to be sent as an `update`, or the
+  validator refuses the revision for a reason that has nothing to do with the
+  developer's feedback.
+
+### Fixed
+
+- **A revision could overwrite an edit made while the model was thinking.** The
+  model takes seconds to minutes; a developer who keeps typing in that window had
+  their work replaced by the revised file, with no undo. The file's content is now
+  recorded when the request goes out and re-read immediately before anything is
+  applied. If it moved — edited, created, deleted, or the batch advanced a version
+  — the revision is refused and the developer's bytes are kept, with a message
+  that says which of those happened.
+- **A revision reply of another type was treated as a failed revision.** A
+  `chat_response` answering the question, or a `clarification_request` asking the
+  one thing that blocks the change, is a valid answer the developer can read. It
+  is now shown as such, and the file keeps its content, instead of being reported
+  as a missing-`changes` contract error.
+- **A failed revision reported only that it had not been applied.** Which leaves
+  "the revision was not applied" to be read as "something else was". A revision
+  that never produces an applicable change now names the file and states that it
+  is unchanged.
+
 ## [0.4.0]
 
 Code review moved into the editor, and the provider/model screens moved out of
